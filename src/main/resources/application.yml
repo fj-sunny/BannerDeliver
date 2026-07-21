@@ -1,0 +1,93 @@
+spring:
+  application:
+    name: ${APPLICATION_NAME:banner-deliver}
+  config:
+    # 将项目根目录的 .env 当作 properties 文件加载；文件不存在时仍可正常启动。
+    import: optional:file:.env[.properties]
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: "jdbc:mysql://${DB_HOST:127.0.0.1}:${DB_PORT:3306}/${DB_NAME:banner_deliver}?useUnicode=true&characterEncoding=UTF-8&serverTimezone=${DB_SERVER_TIMEZONE:Asia/Shanghai}&useSSL=${DB_USE_SSL:false}&allowPublicKeyRetrieval=${DB_ALLOW_PUBLIC_KEY_RETRIEVAL:false}&connectTimeout=${DB_CONNECT_TIMEOUT_MS:3000}&socketTimeout=${DB_SOCKET_TIMEOUT_MS:5000}"
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:}
+    hikari:
+      pool-name: ${DB_POOL_NAME:BannerDeliverHikariPool}
+      minimum-idle: ${DB_POOL_MINIMUM_IDLE:5}
+      maximum-pool-size: ${DB_POOL_MAXIMUM_SIZE:20}
+      connection-timeout: ${DB_POOL_CONNECTION_TIMEOUT_MS:3000}
+      validation-timeout: ${DB_POOL_VALIDATION_TIMEOUT_MS:1000}
+      idle-timeout: ${DB_POOL_IDLE_TIMEOUT_MS:600000}
+      max-lifetime: ${DB_POOL_MAX_LIFETIME_MS:1800000}
+  sql:
+    init:
+      # 建表脚本只供人工执行，避免应用启动时修改已有数据库。
+      mode: never
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      database: ${REDIS_DATABASE:0}
+      username: ${REDIS_USERNAME:}
+      password: ${REDIS_PASSWORD:}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT_MS:2000}ms
+      timeout: ${REDIS_COMMAND_TIMEOUT_MS:1000}ms
+      lettuce:
+        pool:
+          min-idle: ${REDIS_POOL_MIN_IDLE:2}
+          max-idle: ${REDIS_POOL_MAX_IDLE:8}
+          max-active: ${REDIS_POOL_MAX_ACTIVE:16}
+          max-wait: ${REDIS_POOL_MAX_WAIT_MS:1000}ms
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:banner-delivery-consumer}
+      auto-offset-reset: ${KAFKA_AUTO_OFFSET_RESET:earliest}
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        isolation.level: read_committed
+    listener:
+      ack-mode: manual_immediate
+      concurrency: ${KAFKA_LISTENER_CONCURRENCY:3}
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    cache-enabled: false
+    log-impl: ${MYBATIS_LOG_IMPL:org.apache.ibatis.logging.slf4j.Slf4jImpl}
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+
+banner:
+  kafka:
+    event-topic: ${BANNER_EVENT_TOPIC:banner-delivery-event}
+  audience:
+    target-bucket-size: ${BANNER_AUDIENCE_TARGET_BUCKET_SIZE:50000}
+  cache:
+    local:
+      expire-after-write-seconds: ${BANNER_LOCAL_CACHE_EXPIRE_SECONDS:30}
+      maximum-size: ${BANNER_LOCAL_CACHE_MAXIMUM_SIZE:10000}
+    redis:
+      fallback-days: ${BANNER_REDIS_FALLBACK_DAYS:1}
+      expire-after-date-days: ${BANNER_REDIS_EXPIRE_AFTER_DATE_DAYS:2}
+      expire-jitter-max-seconds: ${BANNER_REDIS_EXPIRE_JITTER_MAX_SECONDS:300}
+  reconciliation:
+    enabled: ${BANNER_RECONCILIATION_ENABLED:true}
+    window-minutes: ${BANNER_RECONCILIATION_WINDOW_MINUTES:5}
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.bannerdeliver: ${LOG_LEVEL_APP:INFO}
