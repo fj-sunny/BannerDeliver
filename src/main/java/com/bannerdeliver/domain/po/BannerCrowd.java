@@ -1,10 +1,10 @@
-package com.bannerdeliver.entity;
+package com.bannerdeliver.domain.po;
 
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
-import com.bannerdeliver.infrastructure.mybatis.StringBlobTypeHandler;
+import com.bannerdeliver.config.mybatis.StringBlobTypeHandler;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;

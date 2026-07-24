@@ -73,8 +73,10 @@ mybatis-plus:
 banner:
   kafka:
     event-topic: ${BANNER_EVENT_TOPIC:banner-delivery-event}
+    retry-backoff-ms: ${BANNER_KAFKA_RETRY_BACKOFF_MS:1000}
   audience:
     target-bucket-size: ${BANNER_AUDIENCE_TARGET_BUCKET_SIZE:50000}
+    redis-write-batch-size: ${BANNER_AUDIENCE_REDIS_WRITE_BATCH_SIZE:1000}
   cache:
     local:
       expire-after-write-seconds: ${BANNER_LOCAL_CACHE_EXPIRE_SECONDS:30}
@@ -83,9 +85,15 @@ banner:
       fallback-days: ${BANNER_REDIS_FALLBACK_DAYS:1}
       expire-after-date-days: ${BANNER_REDIS_EXPIRE_AFTER_DATE_DAYS:2}
       expire-jitter-max-seconds: ${BANNER_REDIS_EXPIRE_JITTER_MAX_SECONDS:300}
+      zone-id: ${BANNER_CACHE_ZONE_ID:Asia/Shanghai}
   reconciliation:
     enabled: ${BANNER_RECONCILIATION_ENABLED:true}
     window-minutes: ${BANNER_RECONCILIATION_WINDOW_MINUTES:5}
+    cron: "${BANNER_RECONCILIATION_CRON:0 */5 * * * *}"
+  delivery:
+    default-banner:
+      banner-id: ${BANNER_DEFAULT_ID:0}
+      url: ${BANNER_DEFAULT_URL:https://cdn.example.com/default-banner.png}
 
 logging:
   level:

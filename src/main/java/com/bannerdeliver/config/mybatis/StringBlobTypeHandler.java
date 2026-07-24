@@ -1,4 +1,4 @@
-package com.bannerdeliver.infrastructure.mybatis;
+package com.bannerdeliver.config.mybatis;
 
 import org.apache.ibatis.type.BaseTypeHandler;
 import org.apache.ibatis.type.JdbcType;

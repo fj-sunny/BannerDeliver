@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS banner_info (
     update_time VARCHAR(19) NOT NULL COMMENT '更新时间，格式：yyyy-MM-dd HH:mm:ss',
     PRIMARY KEY (banner_id),
     INDEX idx_product_id (product_id),
+    INDEX idx_update_time (update_time),
     INDEX idx_product_time (product_id, begin_time, end_time)
 ) ENGINE=InnoDB
   DEFAULT CHARSET=utf8mb4
