@@ -1,4 +1,4 @@
-package com.bannerdeliver.cache.support;
+package com.bannerdeliver.utils;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -10,9 +10,6 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * user_list 推荐存 JSON 数组；同时兼容逗号和换行分隔的历史数据。
- */
-/**
  * 将 MySQL BLOB 对应的 String 解码为用户 ID。
  *
  * <p>标准格式是 JSON 数组，同时兼容逗号或换行分隔的历史数据。</p>
@@ -23,6 +20,7 @@ public class AudienceUserListCodec {
 
     private final ObjectMapper objectMapper;
 
+    /** 将 BLOB 对应的 String 解码为用户 ID 列表，支持 JSON 数组和逗号/换行分隔格式。 */
     public List<String> decode(String encodedUsers) {
         if (encodedUsers == null || encodedUsers.isBlank()) {
             return List.of();
@@ -38,6 +36,7 @@ public class AudienceUserListCodec {
         return users;
     }
 
+    /** 解析 JSON 数组格式的 user_list。 */
     private List<String> decodeJsonArray(String value) {
         try {
             JsonNode root = objectMapper.readTree(value);
@@ -52,6 +51,7 @@ public class AudienceUserListCodec {
         }
     }
 
+    /** 去除空白后将非空 userId 加入结果列表。 */
     private void addIfPresent(List<String> users, String userId) {
         if (userId != null && !userId.isBlank()) {
             users.add(userId.trim());

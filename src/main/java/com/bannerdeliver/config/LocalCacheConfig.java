@@ -10,9 +10,11 @@ import org.springframework.context.annotation.Configuration;
 import java.time.Duration;
 import java.util.List;
 
+/** Guava 本地缓存（L1）的 Spring Bean 配置。 */
 @Configuration
 public class LocalCacheConfig {
 
+    /** 创建 Banner Runtime 的 Guava 本地缓存，TTL 和容量由配置项驱动。 */
     @Bean
     public Cache<BannerDateCacheKey, List<BannerRuntimeDTO>> bannerRuntimeLocalCache(
             BannerProperties properties) {

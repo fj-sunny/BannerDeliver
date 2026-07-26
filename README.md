@@ -2,87 +2,41 @@
 
 Banner 投放系统后端骨架，基于 Java 17、Spring Boot、MyBatis-Plus 和 MySQL。
 
+## 核心流程
+
+项目只保留四条主链路，代码集中在少数几个 Service 中：
+
+```text
+1. 用户查询   Controller → BannerDeliveryService → BannerCacheService（L1 Guava + L2 Redis）
+2. 数据变更   BannerInfo/CrowdService → MySQL 事务 → Kafka Producer
+3. 缓存刷新   Kafka Consumer → BannerCacheService.refreshFromMysql
+4. 定时对账   BannerReconciliationService → BannerCacheService.repairFromMysql
+```
+
+兜底（历史日期、静态默认 Banner）只在 `BannerDeliveryService` 末尾补充，不是主链路。
+
 ## 当前结构
 
 ```text
 src/main/java/com/bannerdeliver
-├── App.java                         # Spring Boot 启动类
-├── cache/                          # 缓存基础设施，不放业务编排
-│   ├── BannerRuntimeCache.java     # 业务层访问缓存的接口
-│   ├── local/
-│   │   └── BannerLocalCache.java   # Guava 日期缓存
-│   ├── redis/
-│   │   ├── BannerRedisRepository.java # Redis Key 与 Lua 操作
-│   │   └── AudienceCacheWriter.java   # 版本化人群包写入
-│   └── support/
-│       └── AudienceUserListCodec.java # BLOB String 解码
-├── common/
-│   ├── Result.java                 # 统一响应结果
-│   ├── ResultCode.java             # 响应状态码
-│   └── constant/
-│       └── BannerRedisConstant.java # Banner Redis Key 常量
-├── config/
-│   ├── BannerProperties.java       # Banner 类型化配置
-│   ├── KafkaConsumerConfig.java    # Kafka 失败重投配置
-│   ├── LocalCacheConfig.java       # Guava LocalCache 配置
-│   ├── MybatisConfig.java          # MyBatis Mapper 扫描配置
-│   └── mybatis/
-│       └── StringBlobTypeHandler.java
-├── controller/
-│   └── BannerDeliveryController.java # Banner 投放查询接口
-├── domain/
-│   ├── po/
-│   │   ├── BannerInfo.java         # Banner 基础配置实体
-│   │   └── BannerCrowd.java        # Banner 人群包实体
-│   ├── dto/
-│   │   ├── BannerDateCacheKey.java # productId + date 本地缓存键
-│   │   ├── BannerDeliveryResult.java
-│   │   ├── BannerDeliverySource.java
-│   │   ├── BannerDeliveryEvent.java
-│   │   ├── BannerEventType.java
-│   │   └── BannerRuntimeDTO.java
-│   └── vo/
-│       └── BannerDeliveryVO.java   # Banner 投放响应
-├── exception/
-│   ├── BaseException.java
-│   ├── BusinessException.java
-│   ├── ParamException.java
-│   ├── AuthException.java
-│   ├── PermissionDeniedException.java
-│   └── GlobalExceptionHandler.java
-├── kafka/
-│   ├── producer/
-│   │   └── BannerEventProducer.java # Kafka 生产者
-│   └── consumer/
-│       └── BannerEventConsumer.java # Kafka 消费者
-├── mapper/                         # MyBatis 数据访问层
-├── schedule/
-│   ├── BannerReconciliationJob.java
-│   └── BannerReconciliationService.java
+├── App.java
+├── controller/BannerDeliveryController.java   # 用户查询 HTTP 入口
 ├── service/
-│   ├── BannerInfoService.java      # 配置查询、更新、下线
-│   ├── BannerCrowdService.java     # 人群包查询、整体替换
-│   ├── BannerDeliveryService.java  # 当天/昨日/默认查询编排
-│   ├── BannerDeliveryQueryService.java # 单日期投放匹配
-│   ├── BannerCacheRefreshService.java  # MySQL → Redis 刷新
-│   ├── BannerSnapshotService.java  # MySQL 一致快照读取
-│   └── impl/
-│       ├── BannerInfoServiceImpl.java
-│       └── BannerCrowdServiceImpl.java
-└── utils/                          # 无状态工具类
-
-src/main/resources
-├── application.yml                 # 环境变量驱动的应用配置
-├── db/schema.sql                   # 建表脚本
-└── mapper/                         # MyBatis XML 预留目录
+│   ├── BannerDeliveryService.java             # 用户查询 + 兜底编排
+│   ├── BannerCacheService.java                # 多级缓存 + Redis + MySQL 刷新（核心）
+│   ├── BannerInfoService.java                 # Banner 配置写库 + 发 Kafka
+│   └── BannerCrowdService.java                # 人群包写库 + 发 Kafka
+├── kafka/
+│   ├── producer/BannerEventProducer.java
+│   └── consumer/BannerEventConsumer.java
+├── schedule/BannerReconciliationService.java  # 定时对账 + 补偿修复
+├── mapper/、domain/、config/、utils/、common/、exception/
 ```
 
-`service` 只保存 Banner 业务能力和流程编排；`cache`、`kafka`、`schedule` 是独立的技术
-入口或基础设施。`BannerInfoService` 与 `BannerCrowdService` 不暴露 MyBatis-Plus 通用
-`IService`，而是声明项目真正需要的方法，避免 Controller 任意操作数据库。
+`BannerCacheService` 统一承担：Guava L1、Redis L2 读写、人群包分桶写入、版本幂等、消费窗口记录。
 
-配置更新、下线或人群包替换会先完成 MySQL 事务，再由 `BannerEventProducer` 发送 Kafka；
-消费端统一由 `BannerEventConsumer` 从 MySQL 重读最新快照并刷新 Redis。
+配置更新、下线或人群包替换先完成 MySQL 事务，再由 `BannerEventProducer` 发送 Kafka；
+消费端由 `BannerEventConsumer` 调用 `BannerCacheService` 从 MySQL 重读并刷新 Redis。
 
 ## 字段映射
 
@@ -100,18 +54,16 @@ UTF-8 还原，避免依赖 JDBC 驱动的隐式类型转换。
 `user_list` 推荐保存 JSON 数组，例如 `["1001","1002"]`。当前解码器也兼容逗号或
 换行分隔的历史格式。
 
-## cache 包职责
+## 多级缓存
 
-| 类 | 职责 |
-| --- | --- |
-| `BannerRuntimeCache` | 业务层访问运行时缓存的接口，只定义日期查询和人群判断 |
-| `BannerLocalCache` | 保存 `productId + date → BannerRuntimeDTO 列表`，未命中时回源 Redis |
-| `BannerRedisRepository` | 封装 Redis Hash/Set、Key、JSON、Lua 版本栅栏、TTL 和消费窗口 |
-| `AudienceCacheWriter` | 把 MySQL 人群包解码、分桶，并完整写入新的 `audienceBatch` |
-| `AudienceUserListCodec` | 将 BLOB 对应的 String 解码为用户 ID 列表 |
+| 层级 | 实现 | 说明 |
+| --- | --- | --- |
+| L1 | Guava `Cache`（内嵌于 `BannerCacheService`） | Key=`productId+date`，TTL 30s |
+| L2 | Redis Hash | `product:{productId}:date:{yyyyMMdd}` 存 Banner JSON |
+| 人群 | Redis Set | 分桶 `SISMEMBER` 判断用户归属 |
 
-`cache` 包不负责决定“查今天还是昨天”，也不负责消费 Kafka；这些业务顺序分别在
-`BannerDeliveryService` 和 `BannerCacheRefreshService` 中编排。
+查询：`BannerCacheService.getBanners` → 过滤 status/时间 → `isAudienceMember`。
+刷新后主动失效 L1；跨实例最终一致依赖 L1 TTL。
 
 ## Redis 缓存
 
@@ -131,7 +83,7 @@ UTF-8 还原，避免依赖 JDBC 驱动的隐式类型转换。
 - `bucketCount = ceil(userCount / targetBucketSize)`；空人群包为 `0`。
 - `bucketIndex = floorMod(userId.hashCode(), bucketCount)`。
 - 新 `audienceBatch` 全部写完后才切换日期 Hash；旧批次等待 TTL 自动删除。
-- Redis 查询入口为 `BannerRedisRepository.findBanners` 和 `isAudienceMember`。
+- Redis 读写统一在 `BannerCacheService` 中完成。
 
 ## Kafka 刷新
 
@@ -144,8 +96,8 @@ UTF-8 还原，避免依赖 JDBC 驱动的隐式类型转换。
 - 重复事件通过 Redis `updateTime` 版本 Key 幂等跳过。
 
 Kafka Topic 需要在部署环境预先创建。更新 MySQL 成功后，业务服务调用
-`BannerEventProducer.sendAfterCommit(event)` 发送事件。当前
-`BannerInfoServiceImpl` 和 `BannerCrowdServiceImpl` 已接入该生产者。
+`BannerEventProducer.sendAfterCommit(event)` 发送事件。`BannerInfoService`
+和 `BannerCrowdService` 已接入该生产者。
 
 ### 重复消费与幂等
 
@@ -154,11 +106,8 @@ Kafka Topic 需要在部署环境预先创建。更新 MySQL 成功后，业务�
 - 相同 Kafka 消息始终使用同一个 `eventId` 作为 `audienceBatch`。
 - 人群包使用 `SADD`，重复 userId 自动去重；重试会继续补齐中断前未写完的桶。
 - Banner 日期 Hash 按 `bannerId` 执行 `HSET`；删除使用可重复执行的 `HDEL`。
-- 日期 Hash 使用固定绝对 `EXPIREAT`；人群包抖动由 Redis Key 稳定计算，重复执行不会延长 TTL。
-- 日期字段更新通过单 Key Lua 原子完成：先比较 JSON 中的 `updateTime`，只有当前版本不新于待写版本时
-  才执行 `HSET + EXPIREAT`。清理旧日期字段时也执行相同版本检查，旧刷新不能删除新数据。
-- `banner:version:{bannerId}` 和 `banner:date-keys:{bannerId}` 使用相同 Redis Cluster hash tag，
-  通过 Lua 原子更新；旧版本不能覆盖新版本的版本号和日期索引。
+- 写入前先比较 JSON 中的 `updateTime` 和 `banner:version:{bannerId}`，旧版本不能覆盖新版本。
+- 版本比较在 Java 层完成，不使用 Lua。
 
 Consumer 的固定执行顺序为：
 
@@ -177,19 +126,13 @@ message key，保证同分区内消息顺序。
 
 ## Guava LocalCache
 
-- Key：`BannerDateCacheKey(productId, date)`。
-- Value：不可变的 `List<BannerRuntimeDTO>`，不缓存体量较大的人群包。
-- 默认 `expireAfterWrite` 为 30 秒，`maximumSize` 为 10000，分别由
-  `BANNER_LOCAL_CACHE_EXPIRE_SECONDS` 和 `BANNER_LOCAL_CACHE_MAXIMUM_SIZE` 配置。
-- 同一个未命中 Key 的并发查询通过 Guava `Cache.get` 合并回源，避免同时读取 Redis。
-- 查询顺序为 LocalCache → Redis 日期 Hash → LocalCache；取得 Banner 列表后再过滤状态和
-  投放时间，并通过 Redis `SISMEMBER` 判断用户是否属于人群包。
-- Kafka Consumer 完成 Redis 替换或删除后，会主动失效本实例受影响的旧、新
-  `productId + date` 缓存。后续定时补偿复用同一个刷新服务时也会自动触发失效。
-- 本地缓存不做跨实例广播；其他实例最迟在 30 秒 TTL 到期后重新读取 Redis，实现最终一致。
+- Key：`BannerDateCacheKey(productId, date)`，内嵌于 `BannerCacheService`。
+- Value：不可变 `List<BannerRuntimeDTO>`，不缓存人群包。
+- 默认 `expireAfterWrite` 30 秒，`maximumSize` 10000。
+- 并发未命中时 Guava `Cache.get` 合并回源 Redis。
+- Kafka/定时刷新完成后主动失效受影响的 Key。
 
-投放查询入口为 `BannerDeliveryQueryService.findEligibleBanners`；当前没有优先级字段，多个
-Banner 同时命中时按 `bannerId` 升序返回，调用方可通过 `findFirstEligibleBanner` 获取首个结果。
+多个 Banner 同时命中时按 `bannerId` 升序，取第一个。
 
 ## Banner 投放查询接口
 
@@ -197,7 +140,7 @@ Banner 同时命中时按 `bannerId` 升序返回，调用方可通过 `findFirs
 GET /api/v1/banners/delivery?productId=10&userId=1001
 ```
 
-`productId` 必须为正数，`userId` 不能为空且最长 128 个字符。查询过程：
+`productId` 必须为正数，`userId` 不能为空且最长 128 个字符。核心查询过程：
 
 ```text
 当天 productId + date LocalCache
@@ -205,9 +148,9 @@ GET /api/v1/banners/delivery?productId=10&userId=1001
 → 筛选 status=1 和 beginTime <= 当前时间 <= endTime
 → 根据 bucketCount 计算 bucketIndex
 → Redis SISMEMBER 检查 userId
-→ 无合适 Banner 时查询前一天相同时间
-→ 仍未命中时返回静态默认 Banner
 ```
+
+以上逻辑在 `BannerDeliveryService` 中完成；当天未命中时再尝试历史日期兜底。
 
 昨日兜底使用“前一天相同的时分秒”检查投放时间，否则昨日 Runtime 的 `endTime` 与今天时间
 比较时必然已经过期。返回示例：
@@ -238,7 +181,7 @@ BANNER_DEFAULT_URL=https://cdn.example.com/default-banner.png
 
 ## 定时修复与消息对账
 
-`BannerReconciliationJob` 默认每 5 分钟触发，检查上一个完整窗口。例如任务在
+`BannerReconciliationService` 默认每 5 分钟触发，检查上一个完整窗口。例如任务在
 `10:05～10:10` 之间触发时，只处理 `[10:00:00, 10:05:00)`，避免把仍在写入的数据纳入
 对账。由于 `update_time` 固定使用 `yyyy-MM-dd HH:mm:ss`，MySQL 查询可直接使用字符串范围。
 建表脚本已为该范围查询增加 `idx_update_time`。已有数据库需要执行一次：

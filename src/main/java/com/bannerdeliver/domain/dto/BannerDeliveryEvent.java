@@ -11,6 +11,7 @@ import lombok.NoArgsConstructor;
 import java.util.ArrayList;
 import java.util.List;
 
+/** Kafka 缓存刷新事件消息体。 */
 @Data
 @Builder
 @NoArgsConstructor

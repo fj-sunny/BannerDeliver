@@ -3,6 +3,7 @@ package com.bannerdeliver.common;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 
+/** API 响应状态码枚举。 */
 @Getter
 @RequiredArgsConstructor
 public enum ResultCode {

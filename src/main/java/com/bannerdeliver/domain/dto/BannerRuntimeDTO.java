@@ -5,6 +5,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+/** 写入 Redis 日期 Hash 的 Banner 运行时快照。 */
 @Data
 @Builder
 @NoArgsConstructor

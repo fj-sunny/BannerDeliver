@@ -1,4 +1,4 @@
-package com.bannerdeliver.service.impl;
+package com.bannerdeliver.service;
 
 import com.baomidou.mybatisplus.core.conditions.Wrapper;
 import com.bannerdeliver.domain.dto.BannerDeliveryEvent;
@@ -38,7 +38,7 @@ class BannerBusinessServiceTest {
                 .build();
         when(mapper.selectById(20L)).thenReturn(current);
         when(mapper.updateById(any(BannerInfo.class))).thenReturn(1);
-        BannerInfoServiceImpl service = new BannerInfoServiceImpl(mapper, producer, clock);
+        BannerInfoService service = new BannerInfoService(mapper, producer, clock);
         BannerInfo update = BannerInfo.builder()
                 .bannerId(20L)
                 .productId(11L)
@@ -70,7 +70,7 @@ class BannerBusinessServiceTest {
                 .build());
         when(infoMapper.updateById(any(BannerInfo.class))).thenReturn(1);
         when(crowdMapper.insert(any(BannerCrowd.class))).thenReturn(1);
-        BannerCrowdServiceImpl service = new BannerCrowdServiceImpl(
+        BannerCrowdService service = new BannerCrowdService(
                 crowdMapper, infoMapper, producer, clock);
         List<BannerCrowd> crowds = List.of(
                 BannerCrowd.builder()

@@ -1,8 +1,7 @@
 package com.bannerdeliver.kafka.consumer;
 
-import com.bannerdeliver.cache.redis.BannerRedisRepository;
 import com.bannerdeliver.domain.dto.BannerDeliveryEvent;
-import com.bannerdeliver.service.BannerCacheRefreshService;
+import com.bannerdeliver.service.BannerCacheService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.validation.Validation;
 import jakarta.validation.Validator;
@@ -23,11 +22,9 @@ class BannerEventConsumerTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final Validator validator = Validation.buildDefaultValidatorFactory().getValidator();
-    private final BannerCacheRefreshService refreshService =
-            mock(BannerCacheRefreshService.class);
-    private final BannerRedisRepository redisRepository = mock(BannerRedisRepository.class);
+    private final BannerCacheService cacheService = mock(BannerCacheService.class);
     private final BannerEventConsumer consumer = new BannerEventConsumer(
-            objectMapper, validator, refreshService, redisRepository);
+            objectMapper, validator, cacheService);
 
     @Test
     void shouldAcknowledgeEveryDuplicateOnlyAfterRedisStepsSucceed() throws Exception {
@@ -35,36 +32,35 @@ class BannerEventConsumerTest {
         ConsumerRecord<String, String> record = record(event);
         Acknowledgment firstAcknowledgment = mock(Acknowledgment.class);
         Acknowledgment secondAcknowledgment = mock(Acknowledgment.class);
-        when(refreshService.refreshFromMysql(any(BannerDeliveryEvent.class)))
-                .thenReturn(BannerCacheRefreshService.RefreshResult.REFRESHED)
-                .thenReturn(BannerCacheRefreshService.RefreshResult.SKIPPED_SAME_OR_OLDER_VERSION);
+        when(cacheService.refreshFromMysql(any(BannerDeliveryEvent.class)))
+                .thenReturn(BannerCacheService.RefreshResult.REFRESHED)
+                .thenReturn(BannerCacheService.RefreshResult.SKIPPED_SAME_OR_OLDER_VERSION);
 
         consumer.consume(record, firstAcknowledgment);
         consumer.consume(record, secondAcknowledgment);
 
-        var ordered = inOrder(refreshService, redisRepository,
-                firstAcknowledgment, secondAcknowledgment);
-        ordered.verify(refreshService).refreshFromMysql(event);
-        ordered.verify(redisRepository).recordConsumeSuccess(20L, event.getEventTime());
+        var ordered = inOrder(cacheService, firstAcknowledgment, secondAcknowledgment);
+        ordered.verify(cacheService).refreshFromMysql(event);
+        ordered.verify(cacheService).recordConsumeSuccess(20L, event.getEventTime());
         ordered.verify(firstAcknowledgment).acknowledge();
-        ordered.verify(refreshService).refreshFromMysql(event);
-        ordered.verify(redisRepository).recordConsumeSuccess(20L, event.getEventTime());
+        ordered.verify(cacheService).refreshFromMysql(event);
+        ordered.verify(cacheService).recordConsumeSuccess(20L, event.getEventTime());
         ordered.verify(secondAcknowledgment).acknowledge();
-        verify(refreshService, times(2)).refreshFromMysql(event);
+        verify(cacheService, times(2)).refreshFromMysql(event);
     }
 
     @Test
     void shouldNotAcknowledgeWhenBusinessRedisRefreshFails() throws Exception {
         BannerDeliveryEvent event = event();
         Acknowledgment acknowledgment = mock(Acknowledgment.class);
-        when(refreshService.refreshFromMysql(any(BannerDeliveryEvent.class)))
+        when(cacheService.refreshFromMysql(any(BannerDeliveryEvent.class)))
                 .thenThrow(new IllegalStateException("redis unavailable"));
 
         assertThatThrownBy(() -> consumer.consume(record(event), acknowledgment))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("redis unavailable");
 
-        verify(redisRepository, never()).recordConsumeSuccess(any(), any());
+        verify(cacheService, never()).recordConsumeSuccess(any(), any());
         verify(acknowledgment, never()).acknowledge();
     }
 
@@ -72,10 +68,10 @@ class BannerEventConsumerTest {
     void shouldNotAcknowledgeWhenConsumeWindowRecordFails() throws Exception {
         BannerDeliveryEvent event = event();
         Acknowledgment acknowledgment = mock(Acknowledgment.class);
-        when(refreshService.refreshFromMysql(any(BannerDeliveryEvent.class)))
-                .thenReturn(BannerCacheRefreshService.RefreshResult.REFRESHED);
+        when(cacheService.refreshFromMysql(any(BannerDeliveryEvent.class)))
+                .thenReturn(BannerCacheService.RefreshResult.REFRESHED);
         org.mockito.Mockito.doThrow(new IllegalStateException("consume record failed"))
-                .when(redisRepository)
+                .when(cacheService)
                 .recordConsumeSuccess(20L, event.getEventTime());
 
         assertThatThrownBy(() -> consumer.consume(record(event), acknowledgment))

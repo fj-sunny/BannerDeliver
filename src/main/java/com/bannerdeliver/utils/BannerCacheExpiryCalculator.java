@@ -9,18 +9,24 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.util.zip.CRC32;
 
+/** Banner Redis Key 绝对过期时间与稳定抖动的计算。 */
 @Component
 @RequiredArgsConstructor
 public class BannerCacheExpiryCalculator {
 
     private final BannerProperties properties;
 
+    /** 计算日期 Hash 的绝对过期时刻：业务日期 + N 天的 00:00。 */
     public Instant dateCacheExpireAt(LocalDate date) {
         return date.plusDays(properties.getCache().getRedis().getExpireAfterDateDays())
                 .atStartOfDay(properties.getCache().getRedis().getZoneId())
                 .toInstant();
     }
 
+    /**
+     * 基于 Redis Key 的 CRC32 添加稳定抖动秒数。
+     * 同一 Key 重试时抖动值不变，避免 TTL 被重复延长。
+     */
     public Instant withStableJitter(Instant baseExpireAt, String redisKey) {
         int maxJitterSeconds = properties.getCache().getRedis().getExpireJitterMaxSeconds();
         if (maxJitterSeconds <= 0) {

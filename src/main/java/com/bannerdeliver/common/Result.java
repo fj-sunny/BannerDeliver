@@ -5,18 +5,22 @@ package com.bannerdeliver.common;
  */
 public record Result<T>(int code, String message, T data) {
 
+    /** 构造带数据的成功响应。 */
     public static <T> Result<T> success(T data) {
         return new Result<>(ResultCode.SUCCESS.getCode(), ResultCode.SUCCESS.getMessage(), data);
     }
 
+    /** 构造无数据的成功响应。 */
     public static Result<Void> success() {
         return success(null);
     }
 
+    /** 使用 ResultCode 默认消息构造失败响应。 */
     public static Result<Void> failure(ResultCode resultCode) {
         return failure(resultCode, resultCode.getMessage());
     }
 
+    /** 使用自定义消息构造失败响应。 */
     public static Result<Void> failure(ResultCode resultCode, String message) {
         return new Result<>(resultCode.getCode(), message, null);
     }

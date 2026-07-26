@@ -13,6 +13,7 @@ import org.springframework.validation.annotation.Validated;
 
 import java.time.ZoneId;
 
+/** Banner 模块的类型化配置，绑定 application.yml 中 banner.* 前缀。 */
 @Getter
 @Setter
 @Validated
