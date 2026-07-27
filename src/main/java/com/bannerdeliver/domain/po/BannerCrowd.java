@@ -11,9 +11,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.apache.ibatis.type.JdbcType;
 
-/**
- * Banner 人群包分页数据，对应 banner_crowd 表。
- */
+/** Banner 人群包分页数据，对应 banner_crowd 表。 */
 @Data
 @Builder
 @NoArgsConstructor
@@ -21,22 +19,27 @@ import org.apache.ibatis.type.JdbcType;
 @TableName(value = "banner_crowd", autoResultMap = true)
 public class BannerCrowd {
 
+    /** 人群包分页主键，自增。 */
     @TableId(value = "banner_crowd_id", type = IdType.AUTO)
     private Long bannerCrowdId;
 
+    /** 所属 Banner ID。 */
     private Long bannerId;
 
+    /** 分页序号，从 0 起，同一 Banner 内不可重复。 */
     private Integer pageNum;
 
     /**
-     * 数据库列是 BLOB，Java 属性按业务约定保持 String；
-     * StringBlobTypeHandler 统一使用 UTF-8 读写。
+     * 用户 ID 列表，库中为 BLOB。
+     * 标准格式 JSON 数组，兼容逗号/换行分隔；由 StringBlobTypeHandler UTF-8 读写。
      */
     @TableField(value = "user_list", jdbcType = JdbcType.BLOB,
             typeHandler = StringBlobTypeHandler.class)
     private String userList;
 
+    /** 创建时间，格式 yyyy-MM-dd HH:mm:ss。 */
     private String createTime;
 
+    /** 最后更新时间，格式 yyyy-MM-dd HH:mm:ss。 */
     private String updateTime;
 }

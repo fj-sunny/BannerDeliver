@@ -12,9 +12,7 @@ import org.apache.ibatis.type.JdbcType;
 
 /**
  * Banner 基础配置，对应 banner_info 表。
- *
- * <p>数据库中的时间字段是 VARCHAR(19)，因此这里有意使用 String，
- * 不做 LocalDateTime 的隐式转换。</p>
+ * 时间字段在库中为 VARCHAR(19)，Java 侧保持 String 不做隐式转换。
  */
 @Data
 @Builder
@@ -23,22 +21,29 @@ import org.apache.ibatis.type.JdbcType;
 @TableName(value = "banner_info", autoResultMap = true)
 public class BannerInfo {
 
+    /** Banner 主键，自增。 */
     @TableId(value = "banner_id", type = IdType.AUTO)
     private Long bannerId;
 
+    /** 所属商品 ID。 */
     private Long productId;
 
+    /** 投放开始时间，格式 yyyy-MM-dd HH:mm:ss。 */
     private String beginTime;
 
+    /** 投放结束时间，格式 yyyy-MM-dd HH:mm:ss。 */
     private String endTime;
 
+    /** 图片/跳转 URL。 */
     private String url;
 
     /** 状态：0-停用，1-启用。 */
     @TableField(value = "status", jdbcType = JdbcType.TINYINT)
     private Integer status;
 
+    /** 创建时间，格式 yyyy-MM-dd HH:mm:ss。 */
     private String createTime;
 
+    /** 最后更新时间，格式 yyyy-MM-dd HH:mm:ss；对账和幂等比较的依据。 */
     private String updateTime;
 }

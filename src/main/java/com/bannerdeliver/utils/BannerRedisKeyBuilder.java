@@ -19,34 +19,24 @@ public class BannerRedisKeyBuilder {
     private static final Pattern DATE_CACHE_KEY_PATTERN =
             Pattern.compile("^product:(\\d+):date:(\\d{8})$");
 
-    /** 构建商品 + 业务日期的 Banner 缓存 Hash Key。 */
+    /** 构建日期 Hash Key：product:{productId}:date:{yyyyMMdd}。 */
     public String dateCacheKey(Long productId, LocalDate date) {
         return BannerRedisConstant.DATE_CACHE_KEY.formatted(
                 productId, DATE_FORMATTER.format(date));
     }
 
-    /** 构建人群包分桶 Set Key。 */
+    /** 构建人群包分桶 Key：banner:audience:{bannerId}:{audienceBatch}:bucket:{index}。 */
     public String audienceBucketKey(Long bannerId, String audienceBatch, int bucketIndex) {
         return BannerRedisConstant.AUDIENCE_BUCKET_KEY.formatted(
                 bannerId, audienceBatch, bucketIndex);
     }
 
-    /** 构建 Kafka 消费对账窗口 Set Key。 */
+    /** 构建 Kafka 消费对账窗口 Key：mq:consume:{yyyyMMddHHmm}。 */
     public String consumeWindowKey(String window) {
         return BannerRedisConstant.CONSUME_WINDOW_KEY.formatted(window);
     }
 
-    /** 构建 Banner 日期索引 Set Key，记录该 Banner 覆盖的所有日期 Hash。 */
-    public String dateKeyIndex(Long bannerId) {
-        return BannerRedisConstant.DATE_KEY_INDEX.formatted(bannerId);
-    }
-
-    /** 构建 Banner 最新版本 String Key。 */
-    public String versionKey(Long bannerId) {
-        return BannerRedisConstant.VERSION_KEY.formatted(bannerId);
-    }
-
-    /** 从日期 Hash Key 反解析出 productId 和 LocalDate，格式不匹配时返回 empty。 */
+    /** 从日期 Hash Key 反解析出 productId 和 date，格式不匹配时返回 empty。 */
     public Optional<BannerDateCacheKey> parseDateCacheKey(String redisKey) {
         Matcher matcher = DATE_CACHE_KEY_PATTERN.matcher(redisKey);
         if (!matcher.matches()) {

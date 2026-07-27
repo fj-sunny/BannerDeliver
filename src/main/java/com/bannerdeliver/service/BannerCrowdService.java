@@ -23,10 +23,14 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
-/** Banner 人群包的读取与整体替换服务；唯一实现直接收敛在此类。 */
+/**
+ * Banner 人群包写库服务。
+ * 全量替换指定 bannerId 的分页人群数据，并发送 AUDIENCE_UPDATE 事件触发缓存刷新。
+ */
 @Service
 @RequiredArgsConstructor
 public class BannerCrowdService {
+
     private final BannerCrowdMapper bannerCrowdMapper;
     private final BannerInfoMapper bannerInfoMapper;
     private final BannerEventProducer eventProducer;
@@ -38,7 +42,10 @@ public class BannerCrowdService {
                 .eq(BannerCrowd::getBannerId, bannerId).orderByAsc(BannerCrowd::getPageNum)));
     }
 
-    /** 整体替换 Banner 人群包分页，更新 Banner 版本并发送 Kafka 事件。 */
+    /**
+     * 全量替换 Banner 人群包：先删后插，更新 banner_info.update_time，再发 Kafka。
+     * old 投放范围取自当前 Banner（人群变更不改变投放位置，但需支持先删后写）。
+     */
     @Transactional
     public void replaceCrowd(Long bannerId, List<BannerCrowd> crowds) {
         BannerInfo banner = requireBanner(bannerId);
@@ -47,39 +54,60 @@ public class BannerCrowdService {
         String eventTime = BannerDateTimeUtils.DATE_TIME_FORMATTER.format(LocalDateTime.now(bannerClock));
         bannerCrowdMapper.delete(Wrappers.<BannerCrowd>lambdaQuery().eq(BannerCrowd::getBannerId, bannerId));
         for (BannerCrowd crowd : safeCrowds) {
-            BannerCrowd insert = BannerCrowd.builder().bannerId(bannerId).pageNum(crowd.getPageNum())
-                    .userList(crowd.getUserList()).createTime(eventTime).updateTime(eventTime).build();
+            BannerCrowd insert = BannerCrowd.builder()
+                    .bannerId(bannerId)
+                    .pageNum(crowd.getPageNum())
+                    .userList(crowd.getUserList())
+                    .createTime(eventTime)
+                    .updateTime(eventTime)
+                    .build();
             if (bannerCrowdMapper.insert(insert) != 1) {
                 throw new BusinessException("Banner 人群包分页写入失败: bannerId=" + bannerId
                         + ", pageNum=" + insert.getPageNum());
             }
         }
-        if (bannerInfoMapper.updateById(BannerInfo.builder().bannerId(bannerId).updateTime(eventTime).build()) != 1) {
+        if (bannerInfoMapper.updateById(BannerInfo.builder()
+                .bannerId(bannerId).updateTime(eventTime).build()) != 1) {
             throw new BusinessException("Banner 人群包更新时间失败: " + bannerId);
         }
         eventProducer.sendAfterCommit(BannerDeliveryEvent.builder()
-                .eventId("evt_" + UUID.randomUUID()).eventType(BannerEventType.AUDIENCE_UPDATE)
-                .bannerId(bannerId).productId(banner.getProductId()).oldProductId(banner.getProductId())
-                .changedFields(List.of("user_list")).eventTime(eventTime).build());
+                .eventId("evt_" + UUID.randomUUID())
+                .eventType(BannerEventType.AUDIENCE_UPDATE)
+                .bannerId(bannerId)
+                .productId(banner.getProductId())
+                .oldProductId(banner.getProductId())
+                .oldBeginTime(banner.getBeginTime())
+                .oldEndTime(banner.getEndTime())
+                .changedFields(List.of("user_list"))
+                .eventTime(eventTime)
+                .build());
     }
 
-    /** 校验 bannerId 非空且 Banner 存在于 MySQL。 */
+    /** 校验 bannerId 非空且 Banner 存在。 */
     private BannerInfo requireBanner(Long bannerId) {
-        if (bannerId == null) throw new ParamException("bannerId 不能为空");
+        if (bannerId == null) {
+            throw new ParamException("bannerId 不能为空");
+        }
         BannerInfo banner = bannerInfoMapper.selectById(bannerId);
-        if (banner == null) throw new BusinessException("Banner 不存在: " + bannerId);
+        if (banner == null) {
+            throw new BusinessException("Banner 不存在: " + bannerId);
+        }
         return banner;
     }
 
-    /** 校验人群包分页号非负、不重复，且 userList 不为空。 */
+    /** 校验 pageNum 非负且不重复，userList 非空。 */
     private void validatePages(List<BannerCrowd> crowds) {
         Set<Integer> pageNumbers = new HashSet<>();
         for (BannerCrowd crowd : crowds) {
-            if (crowd == null || crowd.getPageNum() == null || crowd.getPageNum() < 0)
+            if (crowd == null || crowd.getPageNum() == null || crowd.getPageNum() < 0) {
                 throw new ParamException("pageNum 必须为非负整数");
-            if (crowd.getUserList() == null) throw new ParamException("userList 不能为空");
-            if (!pageNumbers.add(crowd.getPageNum()))
+            }
+            if (crowd.getUserList() == null) {
+                throw new ParamException("userList 不能为空");
+            }
+            if (!pageNumbers.add(crowd.getPageNum())) {
                 throw new ParamException("pageNum 不能重复: " + crowd.getPageNum());
+            }
         }
     }
 }

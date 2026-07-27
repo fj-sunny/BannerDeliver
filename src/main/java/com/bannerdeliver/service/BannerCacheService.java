@@ -39,13 +39,8 @@ import java.util.concurrent.ExecutionException;
 
 /**
  * Banner 多级缓存核心：Guava L1 + Redis L2，以及 MySQL → Redis 刷新。
- *
- * <p>核心流程：</p>
- * <ol>
- *   <li>查询：L1 未命中回源 Redis 日期 Hash</li>
- *   <li>Kafka/定时刷新：MySQL 快照 → 人群包 SADD → 日期 Hash HSET → 失效 L1</li>
- *   <li>幂等：版本 Key + updateTime 比较，重复消费安全重试</li>
- * </ol>
+ * 查询走 L1→Redis；刷新走 先删旧位置→写人群包→写日期 Hash→失效 L1；
+ * 幂等靠 Hash 内 updateTime 比较 + 人群包 SADD，不使用 version Key。
  */
 @Slf4j
 @Service
@@ -66,12 +61,7 @@ public class BannerCacheService {
     private final BannerInfoService bannerInfoService;
     private final BannerCrowdService bannerCrowdService;
 
-    // ---- 查询：L1 → Redis ----
-
-    /**
-     * 按商品和业务日期查询 Banner 列表。
-     * L1 未命中时回源 Redis 日期 Hash，并发请求合并为一次加载。
-     */
+    /** L1 未命中回源 Redis；并发未命中由 Guava Cache.get 合并为一次加载。 */
     public List<BannerRuntimeDTO> getBanners(Long productId, LocalDate date) {
         BannerDateCacheKey cacheKey = new BannerDateCacheKey(productId, date);
         try {
@@ -82,7 +72,10 @@ public class BannerCacheService {
         }
     }
 
-    /** 根据分桶规则计算 bucketIndex，再执行 Redis SISMEMBER 判断用户是否命中人群包。 */
+    /**
+     * 判断 userId 是否属于该 Banner 的人群包。
+     * bucketIndex 由 userId.hashCode % bucketCount 计算；audienceBatch 用于拼 Redis Key 批次。
+     */
     public boolean isAudienceMember(BannerRuntimeDTO runtime, String userId) {
         if (runtime.getBucketCount() == null || runtime.getBucketCount() <= 0) {
             return false;
@@ -93,35 +86,35 @@ public class BannerCacheService {
         return Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(audienceKey, userId));
     }
 
-    // ---- 刷新：MySQL → Redis → 失效 L1 ----
-
-    /** Kafka 消费入口：以 eventId 作为 audienceBatch 从 MySQL 刷新 Redis。 */
+    /** Kafka 消费入口：先按事件 old 投放范围 HDEL，再写新数据；eventId 作 audienceBatch。 */
     public RefreshResult refreshFromMysql(BannerDeliveryEvent event) {
-        return refreshFromMysql(event.getBannerId(), event.getEventId(), false);
+        return refreshFromMysql(event.getBannerId(), event.getEventId(), placementFromEvent(event));
     }
 
-    /** 定时对账入口：强制刷新，跳过版本 Key 的快速跳过逻辑。 */
+    /** 定时对账补偿：按当前 MySQL 投放范围先删后写。 */
     public RefreshResult repairFromMysql(Long bannerId, String audienceBatch) {
-        return refreshFromMysql(bannerId, audienceBatch, true);
+        BannerSnapshot snapshot = loadSnapshot(bannerId);
+        BannerInfo banner = snapshot.banner();
+        PlacementCleanup cleanup = banner == null ? null
+                : new PlacementCleanup(banner.getProductId(), banner.getBeginTime(), banner.getEndTime());
+        return refreshFromMysql(bannerId, audienceBatch, cleanup);
     }
 
-    /**
-     * 统一的 MySQL → Redis 刷新流程。
-     * 顺序：读快照 → 写人群包 → 切换日期 Hash → 失效 L1。
-     */
+    /** 统一刷新流程：删旧位置→读快照→写人群包→写日期 Hash→失效 L1。 */
     private RefreshResult refreshFromMysql(
-            Long bannerId, String audienceBatch, boolean forceRefresh) {
+            Long bannerId, String audienceBatch, PlacementCleanup cleanup) {
+        Set<BannerDateCacheKey> affected = new HashSet<>();
+        if (cleanup != null) {
+            affected.addAll(deleteRuntimeFromPlacement(
+                    bannerId, cleanup.productId(), cleanup.beginTime(), cleanup.endTime()));
+        }
         BannerSnapshot snapshot = loadSnapshot(bannerId);
         BannerInfo banner = snapshot.banner();
         if (banner == null) {
-            invalidateLocalCache(deleteBanner(bannerId));
+            invalidateLocalCache(affected);
             return RefreshResult.DELETED;
         }
         BannerDateTimeUtils.parseDateTime(banner.getUpdateTime(), "updateTime");
-        if (!forceRefresh && hasSameOrNewerVersion(banner.getBannerId(), banner.getUpdateTime())) {
-            return RefreshResult.SKIPPED_SAME_OR_OLDER_VERSION;
-        }
-
         List<LocalDate> dates = BannerDateTimeUtils.inclusiveDates(
                 banner.getBeginTime(), banner.getEndTime());
         Map<String, Instant> dateKeys = new LinkedHashMap<>();
@@ -130,12 +123,9 @@ public class BannerCacheService {
                     keyBuilder.dateCacheKey(banner.getProductId(), date),
                     expiryCalculator.dateCacheExpireAt(date));
         }
-        Instant audienceExpiry = dateKeys.values().stream()
-                .max(Instant::compareTo)
-                .orElseThrow();
+        Instant audienceExpiry = dateKeys.values().stream().max(Instant::compareTo).orElseThrow();
         int bucketCount = writeAudienceVersion(
                 banner.getBannerId(), audienceBatch, snapshot.crowds(), audienceExpiry);
-
         BannerRuntimeDTO runtime = BannerRuntimeDTO.builder()
                 .bannerId(banner.getBannerId())
                 .productId(banner.getProductId())
@@ -147,23 +137,21 @@ public class BannerCacheService {
                 .audienceBatch(audienceBatch)
                 .updateTime(banner.getUpdateTime())
                 .build();
-        invalidateLocalCache(replaceBannerRuntime(runtime, dateKeys));
-        log.info(
-                "Refreshed banner cache: bannerId={}, batch={}, bucketCount={}, dates={}",
+        affected.addAll(replaceBannerRuntime(runtime, dateKeys));
+        invalidateLocalCache(affected);
+        log.info("Refreshed banner cache: bannerId={}, batch={}, bucketCount={}, dates={}",
                 banner.getBannerId(), audienceBatch, bucketCount, dates.size());
         return RefreshResult.REFRESHED;
     }
 
-    // ---- 对账辅助 ----
-
-    /** 查询对账时间窗口内 update_time 发生变更的 Banner 列表。 */
+    /** 查询对账窗口 [windowStart, windowEnd) 内 update_time 变更的 Banner。 */
     @Transactional(readOnly = true)
     public List<BannerInfo> findUpdatedBetween(
             LocalDateTime windowStart, LocalDateTime windowEnd) {
         return bannerInfoService.findUpdatedBetween(windowStart, windowEnd);
     }
 
-    /** 检查 Redis 中每个应覆盖日期的 Runtime 是否都存在且 updateTime 不早于 MySQL。 */
+    /** 检查每个应覆盖日期的 Redis Runtime 是否存在且 updateTime 不早于 MySQL。 */
     public boolean hasLatestRuntime(BannerInfo dbBanner) {
         LocalDateTime dbUpdateTime = BannerDateTimeUtils.parseDateTime(
                 dbBanner.getUpdateTime(), "updateTime");
@@ -187,7 +175,7 @@ public class BannerCacheService {
         return true;
     }
 
-    /** Kafka 消费成功后，将 bannerId 写入对应时间窗口的 Redis Set。 */
+    /** Kafka 消费成功后写入 mq:consume:{window}，供对账使用。 */
     public void recordConsumeSuccess(Long bannerId, String eventTime) {
         LocalDateTime eventDateTime = BannerDateTimeUtils.parseDateTime(eventTime, "eventTime");
         int windowMinutes = properties.getReconciliation().getWindowMinutes();
@@ -195,14 +183,12 @@ public class BannerCacheService {
         LocalDateTime windowStart = eventDateTime.withMinute(minute).withSecond(0).withNano(0);
         String consumeKey = keyBuilder.consumeWindowKey(WINDOW_FORMATTER.format(windowStart));
         redisTemplate.opsForSet().add(consumeKey, String.valueOf(bannerId));
-        redisTemplate.expireAt(
-                consumeKey,
-                Date.from(windowStart.plusDays(2)
-                        .atZone(properties.getCache().getRedis().getZoneId())
-                        .toInstant()));
+        redisTemplate.expireAt(consumeKey, Date.from(windowStart.plusDays(2)
+                .atZone(properties.getCache().getRedis().getZoneId())
+                .toInstant()));
     }
 
-    /** 读取指定对账窗口内 Kafka 已成功消费的 bannerId 集合。 */
+    /** 读取指定对账窗口内已成功消费的 bannerId 集合。 */
     public Set<Long> findConsumedBannerIds(String window) {
         Set<String> members = redisTemplate.opsForSet().members(
                 keyBuilder.consumeWindowKey(window));
@@ -214,15 +200,13 @@ public class BannerCacheService {
             try {
                 bannerIds.add(Long.valueOf(member));
             } catch (NumberFormatException ignored) {
-                // 忽略脏数据，避免中断对账。
+                // 忽略脏数据
             }
         }
         return Set.copyOf(bannerIds);
     }
 
-    // ---- 内部实现 ----
-
-    /** 从 MySQL 读取 Banner 配置及其人群包分页，组成一致快照。 */
+    /** 从 MySQL 读取 Banner 配置及人群包，组成一致快照。 */
     @Transactional(readOnly = true)
     BannerSnapshot loadSnapshot(Long bannerId) {
         BannerInfo banner = bannerInfoService.findById(bannerId);
@@ -232,7 +216,31 @@ public class BannerCacheService {
         return new BannerSnapshot(banner, bannerCrowdService.findByBannerId(bannerId));
     }
 
-    /** 直接从 Redis 日期 Hash 加载并反序列化全部 Banner Runtime。 */
+    /** 从 Kafka 事件提取变更前投放范围；old* 不完整时跳过清理（如对账路径）。 */
+    private PlacementCleanup placementFromEvent(BannerDeliveryEvent event) {
+        if (event.getOldProductId() == null
+                || event.getOldBeginTime() == null
+                || event.getOldEndTime() == null) {
+            return null;
+        }
+        return new PlacementCleanup(
+                event.getOldProductId(), event.getOldBeginTime(), event.getOldEndTime());
+    }
+
+    /** 在指定商品+日期范围内，从各日期 Hash 中 HDEL 该 bannerId 的 Runtime 字段。 */
+    private Set<BannerDateCacheKey> deleteRuntimeFromPlacement(
+            Long bannerId, Long productId, String beginTime, String endTime) {
+        String bannerField = String.valueOf(bannerId);
+        Set<BannerDateCacheKey> affected = new HashSet<>();
+        for (LocalDate date : BannerDateTimeUtils.inclusiveDates(beginTime, endTime)) {
+            String dateKey = keyBuilder.dateCacheKey(productId, date);
+            keyBuilder.parseDateCacheKey(dateKey).ifPresent(affected::add);
+            redisTemplate.opsForHash().delete(dateKey, bannerField);
+        }
+        return Set.copyOf(affected);
+    }
+
+    /** 从 Redis 日期 Hash 读取全部 Banner Runtime 并反序列化。 */
     private List<BannerRuntimeDTO> loadFromRedis(Long productId, LocalDate date) {
         String dateKey = keyBuilder.dateCacheKey(productId, date);
         return redisTemplate.opsForHash().values(dateKey).stream()
@@ -242,13 +250,7 @@ public class BannerCacheService {
                 .toList();
     }
 
-    /** 比较 Redis 版本 Key，相同或更新则跳过重复 Kafka 消息的刷新。 */
-    private boolean hasSameOrNewerVersion(Long bannerId, String updateTime) {
-        String cached = redisTemplate.opsForValue().get(keyBuilder.versionKey(bannerId));
-        return cached != null && cached.compareTo(updateTime) >= 0;
-    }
-
-    /** 从 Redis 日期 Hash 读取单个 Banner 的 Runtime JSON。 */
+    /** 读取单个 Banner 在指定商品+日期的 Runtime，不存在或 JSON 非法时返回 empty。 */
     private Optional<BannerRuntimeDTO> findBannerRuntime(
             Long productId, LocalDate date, Long bannerId) {
         Object runtimeJson = redisTemplate.opsForHash().get(
@@ -263,12 +265,9 @@ public class BannerCacheService {
         }
     }
 
-    /** 解码人群包、分桶并批量 SADD 到新的 audienceBatch，返回 bucketCount。 */
+    /** 将人群包用户按 bucketIndex 分桶写入 Redis Set，返回 bucketCount。 */
     private int writeAudienceVersion(
-            Long bannerId,
-            String audienceBatch,
-            List<BannerCrowd> crowds,
-            Instant baseExpireAt) {
+            Long bannerId, String audienceBatch, List<BannerCrowd> crowds, Instant baseExpireAt) {
         long userCount = crowds.stream()
                 .map(BannerCrowd::getUserList)
                 .map(userListCodec::decode)
@@ -297,68 +296,38 @@ public class BannerCacheService {
         return bucketCount;
     }
 
-    /** 将缓冲区中的 userId 批量写入指定人群桶 Set 并设置 TTL。 */
+    /** 批量 SADD 一个桶内的 userId 并设置带抖动的 TTL。 */
     private void flushAudienceMembers(
-            Long bannerId,
-            String audienceBatch,
-            int bucketIndex,
-            List<String> userIds,
-            Instant baseExpireAt) {
+            Long bannerId, String audienceBatch, int bucketIndex,
+            List<String> userIds, Instant baseExpireAt) {
         if (userIds.isEmpty()) {
             return;
         }
         String audienceKey = keyBuilder.audienceBucketKey(bannerId, audienceBatch, bucketIndex);
         redisTemplate.opsForSet().add(audienceKey, userIds.toArray(String[]::new));
-        redisTemplate.expireAt(
-                audienceKey,
+        redisTemplate.expireAt(audienceKey,
                 Date.from(expiryCalculator.withStableJitter(baseExpireAt, audienceKey)));
         userIds.clear();
     }
 
-    /** 切换 Banner 日期 Hash 并更新版本/索引，返回需失效的 L1 Key 集合。 */
+    /** 将 Runtime JSON 写入各日期 Hash，返回受影响的 L1 Key 集合。 */
     private Set<BannerDateCacheKey> replaceBannerRuntime(
             BannerRuntimeDTO runtime, Map<String, Instant> dateKeysAndExpiry) {
         String bannerField = String.valueOf(runtime.getBannerId());
         String runtimeJson = serialize(runtime);
         String updateTime = runtime.getUpdateTime();
-        String dateIndexKey = keyBuilder.dateKeyIndex(runtime.getBannerId());
-        Set<String> oldDateKeys = redisTemplate.opsForSet().members(dateIndexKey);
         Set<BannerDateCacheKey> affected = new HashSet<>();
-
         dateKeysAndExpiry.forEach((dateKey, expireAt) -> {
             keyBuilder.parseDateCacheKey(dateKey).ifPresent(affected::add);
             upsertRuntimeField(dateKey, bannerField, updateTime, runtimeJson, expireAt);
         });
-
-        if (oldDateKeys != null) {
-            oldDateKeys.stream()
-                    .filter(oldKey -> !dateKeysAndExpiry.containsKey(oldKey))
-                    .forEach(oldKey -> {
-                        keyBuilder.parseDateCacheKey(oldKey).ifPresent(affected::add);
-                        deleteRuntimeFieldIfNotNewer(oldKey, bannerField, updateTime);
-                    });
-        }
-
-        if (!dateKeysAndExpiry.isEmpty()) {
-            Instant maxExpireAt = dateKeysAndExpiry.values().stream()
-                    .max(Instant::compareTo)
-                    .orElseThrow();
-            updateMetadata(
-                    runtime.getBannerId(),
-                    updateTime,
-                    dateKeysAndExpiry.keySet(),
-                    expiryCalculator.withStableJitter(maxExpireAt, dateIndexKey));
-        }
         return Set.copyOf(affected);
     }
 
-    /** 向日期 Hash 写入 Runtime 字段，旧 updateTime 不会被覆盖。 */
+    /** HSET 单个 Hash 字段；若已有更新版本则跳过，防止旧消息覆盖新数据。 */
     private void upsertRuntimeField(
-            String dateKey,
-            String bannerField,
-            String updateTime,
-            String runtimeJson,
-            Instant expireAt) {
+            String dateKey, String bannerField, String updateTime,
+            String runtimeJson, Instant expireAt) {
         if (isHashFieldNewer(dateKey, bannerField, updateTime)) {
             return;
         }
@@ -366,16 +335,7 @@ public class BannerCacheService {
         redisTemplate.expireAt(dateKey, Date.from(expireAt));
     }
 
-    /** 删除过期日期 Hash 中的 Banner 字段，较新版本不会被旧任务删除。 */
-    private void deleteRuntimeFieldIfNotNewer(
-            String dateKey, String bannerField, String updateTime) {
-        if (isHashFieldNewer(dateKey, bannerField, updateTime)) {
-            return;
-        }
-        redisTemplate.opsForHash().delete(dateKey, bannerField);
-    }
-
-    /** 判断 Hash 中现有 Runtime 的 updateTime 是否严格新于待写入版本。 */
+    /** 判断 Hash 中现有 Runtime 的 updateTime 是否严格晚于待写入值。 */
     private boolean isHashFieldNewer(String dateKey, String bannerField, String updateTime) {
         Object current = redisTemplate.opsForHash().get(dateKey, bannerField);
         if (current == null) {
@@ -390,54 +350,14 @@ public class BannerCacheService {
         }
     }
 
-    /** 更新 banner:version 和 banner:date-keys 索引，旧版本不能覆盖新版本。 */
-    private void updateMetadata(
-            Long bannerId,
-            String updateTime,
-            Collection<String> dateKeys,
-            Instant indexExpireAt) {
-        String versionKey = keyBuilder.versionKey(bannerId);
-        String cachedVersion = redisTemplate.opsForValue().get(versionKey);
-        if (cachedVersion != null && cachedVersion.compareTo(updateTime) > 0) {
-            return;
-        }
-        String dateIndexKey = keyBuilder.dateKeyIndex(bannerId);
-        redisTemplate.delete(dateIndexKey);
-        if (!dateKeys.isEmpty()) {
-            redisTemplate.opsForSet().add(dateIndexKey, dateKeys.toArray(String[]::new));
-        }
-        redisTemplate.opsForValue().set(versionKey, updateTime);
-        Date expireAt = Date.from(indexExpireAt);
-        redisTemplate.expireAt(versionKey, expireAt);
-        redisTemplate.expireAt(dateIndexKey, expireAt);
-    }
-
-    /** 幂等删除 Banner 的全部日期 Hash 字段、版本 Key 和日期索引。 */
-    private Set<BannerDateCacheKey> deleteBanner(Long bannerId) {
-        String bannerField = String.valueOf(bannerId);
-        String dateIndexKey = keyBuilder.dateKeyIndex(bannerId);
-        Set<String> dateKeys = redisTemplate.opsForSet().members(dateIndexKey);
-        Set<BannerDateCacheKey> affected = new HashSet<>();
-        if (dateKeys != null) {
-            dateKeys.stream()
-                    .map(keyBuilder::parseDateCacheKey)
-                    .flatMap(Optional::stream)
-                    .forEach(affected::add);
-            dateKeys.forEach(dateKey ->
-                    redisTemplate.opsForHash().delete(dateKey, bannerField));
-        }
-        redisTemplate.delete(List.of(dateIndexKey, keyBuilder.versionKey(bannerId)));
-        return Set.copyOf(affected);
-    }
-
-    /** 批量失效 Guava L1 中受 Redis 刷新影响的 productId + date Key。 */
+    /** 批量失效 Guava L1 中受影响的 productId+date 条目。 */
     private void invalidateLocalCache(Collection<BannerDateCacheKey> cacheKeys) {
         if (!cacheKeys.isEmpty()) {
             localCache.invalidateAll(cacheKeys);
         }
     }
 
-    /** 将 BannerRuntimeDTO 序列化为 JSON 字符串写入 Redis。 */
+    /** 将 Runtime 序列化为 JSON 字符串写入 Redis。 */
     private String serialize(BannerRuntimeDTO runtime) {
         try {
             return objectMapper.writeValueAsString(runtime);
@@ -446,7 +366,7 @@ public class BannerCacheService {
         }
     }
 
-    /** 将 Redis 中的 JSON 字符串反序列化为 BannerRuntimeDTO。 */
+    /** 将 Redis 中的 JSON 反序列化为 Runtime，格式非法时抛 IllegalStateException。 */
     private BannerRuntimeDTO deserialize(String runtimeJson) {
         try {
             return objectMapper.readValue(runtimeJson, BannerRuntimeDTO.class);
@@ -455,17 +375,19 @@ public class BannerCacheService {
         }
     }
 
-    /** MySQL → Redis 刷新的结果状态。 */
+    /** 缓存刷新结果：已写入新数据，或 Banner 已不存在仅做清理。 */
     public enum RefreshResult {
-        /** 已成功刷新 Redis 缓存。 */
+        /** MySQL 有数据且 Redis 已刷新。 */
         REFRESHED,
-        /** Banner 已从 MySQL 删除，Redis 缓存已清理。 */
-        DELETED,
-        /** Redis 版本相同或更新，跳过重复刷新。 */
-        SKIPPED_SAME_OR_OLDER_VERSION
+        /** MySQL 无此 Banner，仅清理旧 Redis 并失效 L1。 */
+        DELETED
     }
 
-    /** Banner 配置与人群包的一致 MySQL 快照。 */
+    /** 变更前投放位置：商品 ID + 起止时间，用于 HDEL 旧日期 Hash。 */
+    private record PlacementCleanup(Long productId, String beginTime, String endTime) {
+    }
+
+    /** MySQL 一致快照：Banner 配置 + 全部分页人群包。 */
     record BannerSnapshot(BannerInfo banner, List<BannerCrowd> crowds) {
     }
 }

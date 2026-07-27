@@ -20,6 +20,8 @@ class BannerMessageJsonTest {
                 .bannerId(20L)
                 .productId(10L)
                 .oldProductId(10L)
+                .oldBeginTime("2026-07-20 10:00:00")
+                .oldEndTime("2026-07-20 23:59:59")
                 .changedFields(List.of("user_list"))
                 .eventTime("2026-07-20 09:30:00")
                 .build();
@@ -30,6 +32,8 @@ class BannerMessageJsonTest {
         assertThat(json.get("eventType").asText()).isEqualTo("AUDIENCE_UPDATE");
         assertThat(json.get("bannerId").asLong()).isEqualTo(20L);
         assertThat(json.get("changedFields").get(0).asText()).isEqualTo("user_list");
+        assertThat(json.get("oldBeginTime").asText()).isEqualTo("2026-07-20 10:00:00");
+        assertThat(json.get("oldEndTime").asText()).isEqualTo("2026-07-20 23:59:59");
     }
 
     @Test

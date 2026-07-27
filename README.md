@@ -71,18 +71,16 @@ UTF-8 还原，避免依赖 JDBC 驱动的隐式类型转换。
 | --- | --- | --- |
 | Banner 日期缓存 | `product:{productId}:date:{yyyyMMdd}` | Hash |
 | 人群包分桶 | `banner:audience:{bannerId}:{audienceBatch}:bucket:{index}` | Set |
-| Banner 日期索引 | `banner:date-keys:{bannerId}` | Set |
-| Banner 最新版本 | `banner:version:{bannerId}` | String |
 | MQ 消费窗口 | `mq:consume:{yyyyMMddHHmm}` | Set |
 
-日期索引和版本 Key 是内部维护 Key，用于删除、商品变更、日期变更清理和阻止旧数据覆盖。
-业务查询仍只读取设计中约定的日期 Hash 与人群包 Set。
+业务查询只读取日期 Hash 与人群包 Set；`mq:consume` 仅用于对账。
 
 - 日期 Hash 在业务日期加两天的 `00:00` 绝对过期。
 - 人群包按整个 Banner 日期范围的最晚过期时间设置 TTL，并加入 Key 派生的稳定抖动。
 - `bucketCount = ceil(userCount / targetBucketSize)`；空人群包为 `0`。
 - `bucketIndex = floorMod(userId.hashCode(), bucketCount)`。
-- 新 `audienceBatch` 全部写完后才切换日期 Hash；旧批次等待 TTL 自动删除。
+- 刷新前先按事件携带的 `oldProductId + oldBeginTime + oldEndTime` 对旧日期 Hash 执行 `HDEL`，再写入新数据。
+- 新 `audienceBatch` 全部写完后才写入日期 Hash；旧批次等待 TTL 自动删除。
 - Redis 读写统一在 `BannerCacheService` 中完成。
 
 ## Kafka 刷新
@@ -93,7 +91,7 @@ UTF-8 还原，避免依赖 JDBC 驱动的隐式类型转换。
 - 处理失败时不提交 offset，并按固定间隔重新投递。
 - Consumer 只使用消息定位 Banner，业务字段从 MySQL 的 `banner_info`、`banner_crowd`
   重新读取。
-- 重复事件通过 Redis `updateTime` 版本 Key 幂等跳过。
+- 重复事件每次全量刷新；Hash 字段写入前比较 JSON 内 `updateTime`，旧版本不能覆盖新版本。
 
 Kafka Topic 需要在部署环境预先创建。更新 MySQL 成功后，业务服务调用
 `BannerEventProducer.sendAfterCommit(event)` 发送事件。`BannerInfoService`
@@ -104,17 +102,18 @@ Kafka Topic 需要在部署环境预先创建。更新 MySQL 成功后，业务�
 系统不额外保存“已消费 eventId”来阻止重复消息，而是让每一步都可以安全重试：
 
 - 相同 Kafka 消息始终使用同一个 `eventId` 作为 `audienceBatch`。
+- 事件携带 `oldProductId`、`oldBeginTime`、`oldEndTime`，刷新前先 HDEL 旧投放范围。
 - 人群包使用 `SADD`，重复 userId 自动去重；重试会继续补齐中断前未写完的桶。
-- Banner 日期 Hash 按 `bannerId` 执行 `HSET`；删除使用可重复执行的 `HDEL`。
-- 写入前先比较 JSON 中的 `updateTime` 和 `banner:version:{bannerId}`，旧版本不能覆盖新版本。
-- 版本比较在 Java 层完成，不使用 Lua。
+- Banner 日期 Hash 按 `bannerId` 执行 `HSET`；清理使用可重复执行的 `HDEL`。
+- 写入前比较 Hash 字段 JSON 中的 `updateTime`，旧版本不能覆盖新版本。
 
 Consumer 的固定执行顺序为：
 
 ```text
-查询 MySQL 最新快照
+按事件 old 投放范围 HDEL 旧日期 Hash
+→ 查询 MySQL 最新快照
 → 完整写入版本化人群包
-→ 切换 Banner 日期 Hash
+→ 写入 Banner 日期 Hash
 → 清理 LocalCache
 → SADD mq:consume:{window} bannerId
 → acknowledge Kafka offset

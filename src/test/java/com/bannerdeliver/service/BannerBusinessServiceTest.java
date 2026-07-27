@@ -35,6 +35,8 @@ class BannerBusinessServiceTest {
         BannerInfo current = BannerInfo.builder()
                 .bannerId(20L)
                 .productId(10L)
+                .beginTime("2026-07-20 10:00:00")
+                .endTime("2026-07-20 23:59:59")
                 .build();
         when(mapper.selectById(20L)).thenReturn(current);
         when(mapper.updateById(any(BannerInfo.class))).thenReturn(1);
@@ -55,6 +57,8 @@ class BannerBusinessServiceTest {
                 .isEqualTo(BannerEventType.BANNER_UPDATE);
         assertThat(eventCaptor.getValue().getProductId()).isEqualTo(11L);
         assertThat(eventCaptor.getValue().getOldProductId()).isEqualTo(10L);
+        assertThat(eventCaptor.getValue().getOldBeginTime()).isEqualTo("2026-07-20 10:00:00");
+        assertThat(eventCaptor.getValue().getOldEndTime()).isEqualTo("2026-07-20 23:59:59");
         assertThat(eventCaptor.getValue().getChangedFields())
                 .containsExactly("product_id", "url");
     }

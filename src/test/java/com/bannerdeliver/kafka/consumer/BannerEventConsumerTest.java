@@ -34,7 +34,7 @@ class BannerEventConsumerTest {
         Acknowledgment secondAcknowledgment = mock(Acknowledgment.class);
         when(cacheService.refreshFromMysql(any(BannerDeliveryEvent.class)))
                 .thenReturn(BannerCacheService.RefreshResult.REFRESHED)
-                .thenReturn(BannerCacheService.RefreshResult.SKIPPED_SAME_OR_OLDER_VERSION);
+                .thenReturn(BannerCacheService.RefreshResult.REFRESHED);
 
         consumer.consume(record, firstAcknowledgment);
         consumer.consume(record, secondAcknowledgment);
@@ -97,6 +97,8 @@ class BannerEventConsumerTest {
                 .bannerId(20L)
                 .productId(10L)
                 .oldProductId(10L)
+                .oldBeginTime("2026-07-20 10:00:00")
+                .oldEndTime("2026-07-20 23:59:59")
                 .eventTime("2026-07-20 09:30:00")
                 .build();
     }

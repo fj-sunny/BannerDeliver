@@ -158,16 +158,25 @@ public class BannerReconciliationService {
         return ids.stream().sorted().toList();
     }
 
-    /** 对账结果快照，各集合在构造时转为不可变 Set。 */
+    /** 对账结果快照，各 ID 集合在构造时转为不可变 Set。 */
     public record BannerAuditResult(
+            /** 对账窗口起始时刻（含）。 */
             LocalDateTime windowStart,
+            /** 对账窗口结束时刻（不含）。 */
             LocalDateTime windowEnd,
+            /** MySQL 在该窗口内有 update_time 变更的 bannerId。 */
             Set<Long> dbChangedIds,
+            /** Redis Runtime 已与 MySQL 对齐、无需修复的 bannerId。 */
             Set<Long> redisLatestIds,
+            /** 定时任务已成功修复 Redis 的 bannerId。 */
             Set<Long> scheduleRepairIds,
+            /** Kafka 消费窗口记录中出现过的 bannerId。 */
             Set<Long> mqConsumedIds,
+            /** 定时修复了但 Kafka 窗口无记录的 bannerId（疑似丢消息）。 */
             Set<Long> suspectedLostIds,
+            /** 定时修复了且 Kafka 有记录但 Redis 仍过期的 bannerId。 */
             Set<Long> consumeButStaleIds,
+            /** 修复过程中抛异常的 bannerId。 */
             Set<Long> repairFailedIds) {
 
         /** 规范化各集合并拷贝为不可变 Set。 */
