@@ -4,8 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
-import java.util.List;
-
 import static org.assertj.core.api.Assertions.assertThat;
 
 class BannerMessageJsonTest {
@@ -16,24 +14,18 @@ class BannerMessageJsonTest {
     void shouldSerializeKafkaEventWithSpecifiedFields() throws Exception {
         BannerDeliveryEvent event = BannerDeliveryEvent.builder()
                 .eventId("evt_20260720_001")
-                .eventType(BannerEventType.AUDIENCE_UPDATE)
                 .bannerId(20L)
-                .productId(10L)
-                .oldProductId(10L)
-                .oldBeginTime("2026-07-20 10:00:00")
-                .oldEndTime("2026-07-20 23:59:59")
-                .changedFields(List.of("user_list"))
-                .eventTime("2026-07-20 09:30:00")
+                .eventType(BannerEventType.AUDIENCE_UPDATE)
+                .eventTime(1784511000000L)
                 .build();
 
         JsonNode json = objectMapper.readTree(objectMapper.writeValueAsString(event));
 
         assertThat(json.get("eventId").asText()).isEqualTo("evt_20260720_001");
-        assertThat(json.get("eventType").asText()).isEqualTo("AUDIENCE_UPDATE");
         assertThat(json.get("bannerId").asLong()).isEqualTo(20L);
-        assertThat(json.get("changedFields").get(0).asText()).isEqualTo("user_list");
-        assertThat(json.get("oldBeginTime").asText()).isEqualTo("2026-07-20 10:00:00");
-        assertThat(json.get("oldEndTime").asText()).isEqualTo("2026-07-20 23:59:59");
+        assertThat(json.get("eventType").asText()).isEqualTo("AUDIENCE_UPDATE");
+        assertThat(json.get("eventTime").asLong()).isEqualTo(1784511000000L);
+        assertThat(json.size()).isEqualTo(4);
     }
 
     @Test
@@ -42,12 +34,12 @@ class BannerMessageJsonTest {
                 .bannerId(20L)
                 .productId(10L)
                 .url("https://cdn.example.com/banner.png")
-                .beginTime("2026-07-20 10:00:00")
-                .endTime("2026-07-20 23:59:59")
+                .beginTime(1784512800000L)
+                .endTime(1784563199000L)
                 .status(1)
                 .bucketCount(20)
                 .audienceBatch("evt_20260720_001")
-                .updateTime("2026-07-20 09:30:00")
+                .updateTime(1784511000000L)
                 .build();
 
         BannerRuntimeDTO decoded = objectMapper.readValue(

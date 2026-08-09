@@ -4,12 +4,10 @@ import com.bannerdeliver.config.BannerProperties;
 import com.bannerdeliver.domain.dto.BannerDeliveryResult;
 import com.bannerdeliver.domain.dto.BannerDeliverySource;
 import com.bannerdeliver.domain.dto.BannerRuntimeDTO;
-import com.bannerdeliver.utils.BannerDateTimeUtils;
+import com.bannerdeliver.utils.BannerTimeUtils;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
-import java.time.Clock;
-import java.time.LocalDateTime;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
@@ -26,43 +24,49 @@ public class BannerDeliveryService {
 
     private final BannerCacheService cacheService;
     private final BannerProperties properties;
-    private final Clock bannerClock;
 
     /**
      * 用户 Banner 投放查询入口。
      * 优先当天命中，未命中则走历史日期或静态默认兜底。
      */
     public BannerDeliveryResult query(Long productId, String userId) {
-        LocalDateTime queryTime = LocalDateTime.now(bannerClock);
+        Long queryTime = System.currentTimeMillis();
+        Long queryDate = BannerTimeUtils.startOfDay(
+                queryTime, properties.getCache().getRedis().getZoneOffsetMillis());
 
-        Optional<BannerRuntimeDTO> today = findFirstEligible(productId, userId, queryTime);
+        Optional<BannerRuntimeDTO> today = findFirstEligible(
+                productId, userId, queryTime, queryDate);
         if (today.isPresent()) {
             return new BannerDeliveryResult(
-                    today.get(), BannerDeliverySource.TODAY, queryTime.toLocalDate());
+                    today.get(),
+                    BannerDeliverySource.TODAY,
+                    queryDate);
         }
         return resolveFallback(productId, userId, queryTime);
     }
 
     /** 返回指定业务日期内所有符合状态、投放时间和人群条件的 Banner。 */
     public List<BannerRuntimeDTO> findEligibleBanners(
-            Long productId, String userId, LocalDateTime queryTime) {
-        return eligibleCandidates(productId, queryTime)
+            Long productId, String userId, Long queryTime) {
+        Long queryDate = BannerTimeUtils.startOfDay(
+                queryTime, properties.getCache().getRedis().getZoneOffsetMillis());
+        return eligibleCandidates(productId, queryTime, queryDate)
                 .filter(runtime -> cacheService.isAudienceMember(runtime, userId))
                 .toList();
     }
 
     /** 返回首个符合条件的 Banner，按 bannerId 升序取第一个。 */
     private Optional<BannerRuntimeDTO> findFirstEligible(
-            Long productId, String userId, LocalDateTime queryTime) {
-        return eligibleCandidates(productId, queryTime)
+            Long productId, String userId, Long queryTime, Long cacheDate) {
+        return eligibleCandidates(productId, queryTime, cacheDate)
                 .filter(runtime -> cacheService.isAudienceMember(runtime, userId))
                 .findFirst();
     }
 
     /** 从缓存加载候选 Banner 并按 status、投放时间过滤排序。 */
     private java.util.stream.Stream<BannerRuntimeDTO> eligibleCandidates(
-            Long productId, LocalDateTime queryTime) {
-        return cacheService.getBanners(productId, queryTime.toLocalDate()).stream()
+            Long productId, Long queryTime, Long cacheDate) {
+        return cacheService.getBanners(productId, cacheDate).stream()
                 .filter(runtime -> Integer.valueOf(1).equals(runtime.getStatus()))
                 .filter(runtime -> isWithinDeliveryTime(runtime, queryTime))
                 .sorted(Comparator.comparing(BannerRuntimeDTO::getBannerId));
@@ -70,17 +74,20 @@ public class BannerDeliveryService {
 
     /** 当天未命中时，尝试历史日期兜底或返回静态默认 Banner。 */
     private BannerDeliveryResult resolveFallback(
-            Long productId, String userId, LocalDateTime queryTime) {
-        int fallbackDays = properties.getCache().getRedis().getFallbackDays();
+            Long productId, String userId, Long queryTime) {
+        Long fallbackDays = properties.getCache().getRedis().getFallbackDays();
         if (fallbackDays > 0) {
-            LocalDateTime fallbackQueryTime = queryTime.minusDays(fallbackDays);
-            Optional<BannerRuntimeDTO> fallback = findFirstEligible(
-                    productId, userId, fallbackQueryTime);
-            if (fallback.isPresent()) {
+            Long fallbackQueryTime = queryTime - fallbackDays * BannerTimeUtils.DAY_MILLIS;
+            Long fallbackDate = BannerTimeUtils.startOfDay(
+                    fallbackQueryTime,
+                    properties.getCache().getRedis().getZoneOffsetMillis());
+            Optional<BannerRuntimeDTO> fallbackBanner = findFirstEligible(
+                    productId, userId, fallbackQueryTime, fallbackDate);
+            if (fallbackBanner.isPresent()) {
                 return new BannerDeliveryResult(
-                        fallback.get(),
+                        fallbackBanner.get(),
                         BannerDeliverySource.PREVIOUS_DATE,
-                        fallbackQueryTime.toLocalDate());
+                        fallbackDate);
             }
         }
 
@@ -99,11 +106,11 @@ public class BannerDeliveryService {
     }
 
     /** 判断 queryTime 是否落在 Banner 的 beginTime 与 endTime 之间（含边界）。 */
-    private boolean isWithinDeliveryTime(BannerRuntimeDTO runtime, LocalDateTime queryTime) {
-        LocalDateTime beginTime = BannerDateTimeUtils.parseDateTime(
-                runtime.getBeginTime(), "beginTime");
-        LocalDateTime endTime = BannerDateTimeUtils.parseDateTime(
-                runtime.getEndTime(), "endTime");
-        return !queryTime.isBefore(beginTime) && !queryTime.isAfter(endTime);
+    private boolean isWithinDeliveryTime(BannerRuntimeDTO runtime, Long queryTime) {
+        return runtime.getBeginTime() != null
+                && runtime.getEndTime() != null
+                && queryTime >= runtime.getBeginTime()
+                && queryTime <= runtime.getEndTime();
     }
+
 }

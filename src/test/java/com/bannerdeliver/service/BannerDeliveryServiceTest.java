@@ -4,14 +4,10 @@ import com.bannerdeliver.config.BannerProperties;
 import com.bannerdeliver.domain.dto.BannerDeliveryResult;
 import com.bannerdeliver.domain.dto.BannerDeliverySource;
 import com.bannerdeliver.domain.dto.BannerRuntimeDTO;
+import com.bannerdeliver.utils.BannerTimeUtils;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.time.Clock;
-import java.time.Instant;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
 import java.util.List;
 import java.util.Optional;
 
@@ -23,38 +19,36 @@ import static org.mockito.Mockito.when;
 
 class BannerDeliveryServiceTest {
 
-    private static final LocalDateTime NOW =
-            LocalDateTime.of(2026, 7, 20, 12, 0);
+    private static final Long NOW = System.currentTimeMillis();
+    private static final Long TODAY = BannerTimeUtils.startOfDay(NOW, 28_800_000L);
+    private static final Long YESTERDAY = TODAY - BannerTimeUtils.DAY_MILLIS;
     private final BannerCacheService cacheService = mock(BannerCacheService.class);
     private final BannerProperties properties = new BannerProperties();
     private BannerDeliveryService service;
 
     @BeforeEach
     void setUp() {
-        Clock clock = Clock.fixed(
-                Instant.parse("2026-07-20T04:00:00Z"),
-                ZoneId.of("Asia/Shanghai"));
-        service = new BannerDeliveryService(cacheService, properties, clock);
+        service = new BannerDeliveryService(cacheService, properties);
     }
 
     @Test
     void shouldReturnTodayBannerWithoutReadingPreviousDate() {
         BannerRuntimeDTO today = runtime(20L, "today.png");
-        when(cacheService.getBanners(10L, NOW.toLocalDate())).thenReturn(List.of(today));
+        when(cacheService.getBanners(10L, TODAY)).thenReturn(List.of(today));
         when(cacheService.isAudienceMember(today, "1001")).thenReturn(true);
 
         BannerDeliveryResult result = service.query(10L, "1001");
 
         assertThat(result.banner()).isSameAs(today);
         assertThat(result.source()).isEqualTo(BannerDeliverySource.TODAY);
-        assertThat(result.cacheDate()).isEqualTo(LocalDate.of(2026, 7, 20));
+        assertThat(result.cacheDate()).isEqualTo(TODAY);
     }
 
     @Test
     void shouldUsePreviousDateWithSameTimeOfDayAsFallback() {
         BannerRuntimeDTO yesterday = runtime(19L, "yesterday.png");
-        when(cacheService.getBanners(10L, NOW.toLocalDate())).thenReturn(List.of());
-        when(cacheService.getBanners(10L, NOW.minusDays(1).toLocalDate()))
+        when(cacheService.getBanners(10L, TODAY)).thenReturn(List.of());
+        when(cacheService.getBanners(10L, YESTERDAY))
                 .thenReturn(List.of(yesterday));
         when(cacheService.isAudienceMember(yesterday, "1001")).thenReturn(true);
 
@@ -62,13 +56,13 @@ class BannerDeliveryServiceTest {
 
         assertThat(result.banner()).isSameAs(yesterday);
         assertThat(result.source()).isEqualTo(BannerDeliverySource.PREVIOUS_DATE);
-        assertThat(result.cacheDate()).isEqualTo(LocalDate.of(2026, 7, 19));
+        assertThat(result.cacheDate()).isEqualTo(YESTERDAY);
     }
 
     @Test
     void shouldReturnConfiguredStaticDefaultWhenNoAudienceMatches() {
-        when(cacheService.getBanners(10L, NOW.toLocalDate())).thenReturn(List.of());
-        when(cacheService.getBanners(10L, NOW.minusDays(1).toLocalDate())).thenReturn(List.of());
+        when(cacheService.getBanners(10L, TODAY)).thenReturn(List.of());
+        when(cacheService.getBanners(10L, YESTERDAY)).thenReturn(List.of());
         properties.getDelivery().getDefaultBanner().setBannerId(0L);
         properties.getDelivery().getDefaultBanner().setUrl("https://cdn/default.png");
 
@@ -86,9 +80,9 @@ class BannerDeliveryServiceTest {
         BannerRuntimeDTO eligible = runtime(20L, "eligible.png");
         BannerRuntimeDTO offline = BannerRuntimeDTO.builder()
                 .bannerId(21L).status(0)
-                .beginTime("2026-07-20 10:00:00").endTime("2026-07-20 23:59:59").build();
+                .beginTime(NOW - 1000L).endTime(NOW + 1000L).build();
         BannerRuntimeDTO audienceMiss = runtime(22L, "miss.png");
-        when(cacheService.getBanners(10L, NOW.toLocalDate()))
+        when(cacheService.getBanners(10L, TODAY))
                 .thenReturn(List.of(audienceMiss, offline, eligible));
         when(cacheService.isAudienceMember(eligible, "1001")).thenReturn(true);
         when(cacheService.isAudienceMember(audienceMiss, "1001")).thenReturn(false);
@@ -104,8 +98,8 @@ class BannerDeliveryServiceTest {
                 .productId(10L)
                 .url(url)
                 .status(1)
-                .beginTime("2026-07-19 00:00:00")
-                .endTime("2026-07-20 23:59:59")
+                .beginTime(NOW - 2 * BannerTimeUtils.DAY_MILLIS)
+                .endTime(NOW + BannerTimeUtils.DAY_MILLIS)
                 .build();
     }
 }

@@ -10,10 +10,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.apache.ibatis.type.JdbcType;
 
-/**
- * Banner 基础配置，对应 banner_info 表。
- * 时间字段在库中为 VARCHAR(19)，Java 侧保持 String 不做隐式转换。
- */
+/** Banner 基础配置，对应 banner_info 表；所有时间均为 Unix 毫秒。 */
 @Data
 @Builder
 @NoArgsConstructor
@@ -28,11 +25,11 @@ public class BannerInfo {
     /** 所属商品 ID。 */
     private Long productId;
 
-    /** 投放开始时间，格式 yyyy-MM-dd HH:mm:ss。 */
-    private String beginTime;
+    /** 投放开始时间，Unix 毫秒。 */
+    private Long beginTime;
 
-    /** 投放结束时间，格式 yyyy-MM-dd HH:mm:ss。 */
-    private String endTime;
+    /** 投放结束时间，Unix 毫秒。 */
+    private Long endTime;
 
     /** 图片/跳转 URL。 */
     private String url;
@@ -41,9 +38,9 @@ public class BannerInfo {
     @TableField(value = "status", jdbcType = JdbcType.TINYINT)
     private Integer status;
 
-    /** 创建时间，格式 yyyy-MM-dd HH:mm:ss。 */
-    private String createTime;
+    /** 创建时间，Unix 毫秒。 */
+    private Long createTime;
 
-    /** 最后更新时间，格式 yyyy-MM-dd HH:mm:ss；对账和幂等比较的依据。 */
-    private String updateTime;
+    /** 最后更新时间，Unix 毫秒。 */
+    private Long updateTime;
 }

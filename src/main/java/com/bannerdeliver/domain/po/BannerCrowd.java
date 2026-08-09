@@ -37,9 +37,9 @@ public class BannerCrowd {
             typeHandler = StringBlobTypeHandler.class)
     private String userList;
 
-    /** 创建时间，格式 yyyy-MM-dd HH:mm:ss。 */
-    private String createTime;
+    /** 创建时间，Unix 毫秒。 */
+    private Long createTime;
 
-    /** 最后更新时间，格式 yyyy-MM-dd HH:mm:ss。 */
-    private String updateTime;
+    /** 最后更新时间，Unix 毫秒。 */
+    private Long updateTime;
 }

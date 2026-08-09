@@ -11,8 +11,6 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 import org.springframework.validation.annotation.Validated;
 
-import java.time.ZoneId;
-
 /** Banner 模块的类型化配置，绑定 application.yml 中 banner.* 前缀。 */
 @Getter
 @Setter
@@ -47,7 +45,7 @@ public class BannerProperties {
 
         /** 消费失败后重投的固定间隔（毫秒）。 */
         @Min(100)
-        private long retryBackoffMs = 1000;
+        private Long retryBackoffMs = 1000L;
     }
 
     /** 人群包分桶与 Redis 批量写入配置。 */
@@ -83,7 +81,7 @@ public class BannerProperties {
 
         /** 写入后过期时间（秒）。 */
         @Min(1)
-        private int expireAfterWriteSeconds = 30;
+        private Long expireAfterWriteSeconds = 30L;
 
         /** 最大缓存条目数。 */
         @Min(1)
@@ -97,18 +95,18 @@ public class BannerProperties {
 
         /** 当天未命中时，向前回溯的业务天数（0 表示不兜底）。 */
         @Min(0)
-        private int fallbackDays = 1;
+        private Long fallbackDays = 1L;
 
         /** 日期 Hash 在业务日期之后第 N 天 00:00 过期。 */
         @Min(1)
-        private int expireAfterDateDays = 2;
+        private Long expireAfterDateDays = 2L;
 
         /** TTL 稳定抖动上限（秒），同一 Key 抖动值固定。 */
         @Min(0)
-        private int expireJitterMaxSeconds = 300;
+        private Long expireJitterMaxSeconds = 300L;
 
-        /** 业务时区，影响过期时刻、对账窗口和查询时钟。 */
-        private ZoneId zoneId = ZoneId.of("Asia/Shanghai");
+        /** 业务时区相对 UTC 的固定偏移毫秒，默认 UTC+8。 */
+        private Long zoneOffsetMillis = 28_800_000L;
     }
 
     /** 定时对账任务配置。 */
@@ -121,7 +119,7 @@ public class BannerProperties {
 
         /** 对账窗口宽度（分钟）。 */
         @Min(1)
-        private int windowMinutes = 5;
+        private Long windowMinutes = 5L;
 
         /** 定时任务 cron 表达式。 */
         @NotBlank

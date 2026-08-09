@@ -85,7 +85,7 @@ banner:
       fallback-days: ${BANNER_REDIS_FALLBACK_DAYS:1}
       expire-after-date-days: ${BANNER_REDIS_EXPIRE_AFTER_DATE_DAYS:2}
       expire-jitter-max-seconds: ${BANNER_REDIS_EXPIRE_JITTER_MAX_SECONDS:300}
-      zone-id: ${BANNER_CACHE_ZONE_ID:Asia/Shanghai}
+      zone-offset-millis: ${BANNER_CACHE_ZONE_OFFSET_MILLIS:28800000}
   reconciliation:
     enabled: ${BANNER_RECONCILIATION_ENABLED:true}
     window-minutes: ${BANNER_RECONCILIATION_WINDOW_MINUTES:5}

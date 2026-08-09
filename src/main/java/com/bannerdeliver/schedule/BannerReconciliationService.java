@@ -1,6 +1,7 @@
 package com.bannerdeliver.schedule;
 
 import com.bannerdeliver.config.BannerProperties;
+import com.bannerdeliver.domain.dto.BannerEventType;
 import com.bannerdeliver.domain.po.BannerInfo;
 import com.bannerdeliver.service.BannerCacheService;
 import lombok.RequiredArgsConstructor;
@@ -9,15 +10,12 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
 /**
- * 定时对账：MySQL 变更 vs Redis 缓存 vs Kafka 消费窗口。
+ * 定时对账：检查 MySQL 变更是否已经同步到 Redis。
  */
 @Slf4j
 @Service
@@ -29,34 +27,25 @@ import java.util.Set;
         matchIfMissing = true)
 public class BannerReconciliationService {
 
-    private static final DateTimeFormatter WINDOW_KEY_FORMATTER =
-            DateTimeFormatter.ofPattern("yyyyMMddHHmm");
-    private static final DateTimeFormatter WINDOW_LOG_FORMATTER =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
-
     private final BannerCacheService cacheService;
     private final BannerProperties properties;
 
     /** 定时任务入口，处理上一个已结束的完整对账窗口。 */
-    @Scheduled(
-            cron = "${banner.reconciliation.cron:0 */5 * * * *}",
-            zone = "${banner.cache.redis.zone-id:Asia/Shanghai}")
+    @Scheduled(cron = "${banner.reconciliation.cron:0 */5 * * * *}")
     public void reconcile() {
-        reconcilePreviousCompleteWindow(
-                LocalDateTime.now(properties.getCache().getRedis().getZoneId()));
+        reconcilePreviousCompleteWindow(System.currentTimeMillis());
     }
 
     /** 根据当前时间计算并处理上一个完整对账窗口。 */
-    public BannerAuditResult reconcilePreviousCompleteWindow(LocalDateTime now) {
-        int windowMinutes = properties.getReconciliation().getWindowMinutes();
-        LocalDateTime currentWindowStart = floorToWindow(now, windowMinutes);
+    public BannerAuditResult reconcilePreviousCompleteWindow(Long now) {
+        Long windowMinutes = properties.getReconciliation().getWindowMinutes();
+        Long currentWindowStart = floorToWindow(now, windowMinutes);
         return reconcileWindow(
-                currentWindowStart.minusMinutes(windowMinutes), currentWindowStart);
+                currentWindowStart - windowMinutes * 60_000L, currentWindowStart);
     }
 
-    /** 对指定时间窗口执行 MySQL/Redis/Kafka 三方对账与补偿修复。 */
-    BannerAuditResult reconcileWindow(LocalDateTime windowStart, LocalDateTime windowEnd) {
-        String window = WINDOW_KEY_FORMATTER.format(windowStart);
+    /** 对指定时间窗口执行 MySQL/Redis 对账与补偿修复。 */
+    BannerAuditResult reconcileWindow(Long windowStart, Long windowEnd) {
         List<BannerInfo> changedBanners = cacheService.findUpdatedBetween(windowStart, windowEnd);
         Set<Long> dbChangedIds = new LinkedHashSet<>();
         Set<Long> redisLatestIds = new LinkedHashSet<>();
@@ -71,85 +60,49 @@ public class BannerReconciliationService {
                     redisLatestIds.add(bannerId);
                     continue;
                 }
-                BannerCacheService.RefreshResult refreshResult =
-                        cacheService.repairFromMysql(
-                                bannerId, repairAudienceBatch(window, bannerId));
-                if (refreshResult == BannerCacheService.RefreshResult.REFRESHED
-                        || refreshResult == BannerCacheService.RefreshResult.DELETED) {
-                    scheduleRepairIds.add(bannerId);
-                }
+                cacheService.refreshBannerCache(
+                        bannerId,
+                        "schedule_" + windowStart + "_" + bannerId,
+                        BannerEventType.FULL_UPDATE);
+                scheduleRepairIds.add(bannerId);
             } catch (RuntimeException exception) {
                 repairFailedIds.add(bannerId);
                 log.error("Banner schedule repair failed: window={}, bannerId={}",
-                        window, bannerId, exception);
+                        windowStart, bannerId, exception);
             }
         }
 
-        Set<Long> mqConsumedIds = cacheService.findConsumedBannerIds(window);
-        Set<Long> suspectedLostIds = difference(scheduleRepairIds, mqConsumedIds);
-        Set<Long> consumeButStaleIds = intersection(scheduleRepairIds, mqConsumedIds);
         BannerAuditResult result = new BannerAuditResult(
                 windowStart,
                 windowEnd,
                 dbChangedIds,
                 redisLatestIds,
                 scheduleRepairIds,
-                mqConsumedIds,
-                suspectedLostIds,
-                consumeButStaleIds,
                 repairFailedIds);
         logAudit(result);
         return result;
     }
 
     /** 将时间向下取整到最近的对账窗口起始时刻。 */
-    private LocalDateTime floorToWindow(LocalDateTime time, int windowMinutes) {
-        LocalDateTime startOfDay = time.toLocalDate().atStartOfDay();
-        long minuteOfDay = time.getHour() * 60L + time.getMinute();
-        return startOfDay.plusMinutes(minuteOfDay / windowMinutes * windowMinutes);
-    }
-
-    /** 生成定时修复使用的稳定 audienceBatch 标识。 */
-    private String repairAudienceBatch(String window, Long bannerId) {
-        return "schedule_" + window + "_" + bannerId;
-    }
-
-    /** 计算两个 bannerId 集合的差集。 */
-    private Set<Long> difference(Set<Long> left, Set<Long> right) {
-        Set<Long> result = new HashSet<>(left);
-        result.removeAll(right);
-        return Set.copyOf(result);
-    }
-
-    /** 计算两个 bannerId 集合的交集。 */
-    private Set<Long> intersection(Set<Long> left, Set<Long> right) {
-        Set<Long> result = new HashSet<>(left);
-        result.retainAll(right);
-        return Set.copyOf(result);
+    private Long floorToWindow(Long time, Long windowMinutes) {
+        Long windowMillis = windowMinutes * 60_000L;
+        return Math.floorDiv(time, windowMillis) * windowMillis;
     }
 
     /** 输出 [BannerAudit] 对账日志，包含各集合的数量与 ID 明细。 */
     private void logAudit(BannerAuditResult result) {
         log.info("[BannerAudit] window={}~{}, dbChanged={}, redisAlreadyLatest={}, "
-                        + "scheduleRepaired={}, mqConsumed={}, suspectedLost={}, "
-                        + "consumeButStale={}, repairFailed={}, dbChangedIds={}, "
-                        + "redisLatestIds={}, scheduleRepairIds={}, mqConsumedIds={}, "
-                        + "suspectedLostIds={}, consumeButStaleIds={}, repairFailedIds={}",
-                WINDOW_LOG_FORMATTER.format(result.windowStart()),
-                WINDOW_LOG_FORMATTER.format(result.windowEnd()),
+                        + "scheduleRepaired={}, repairFailed={}, dbChangedIds={}, "
+                        + "redisLatestIds={}, scheduleRepairIds={}, repairFailedIds={}",
+                result.windowStart(),
+                result.windowEnd(),
                 result.dbChangedIds().size(),
                 result.redisLatestIds().size(),
                 result.scheduleRepairIds().size(),
-                result.mqConsumedIds().size(),
-                result.suspectedLostIds().size(),
-                result.consumeButStaleIds().size(),
                 result.repairFailedIds().size(),
                 sorted(result.dbChangedIds()),
                 sorted(result.redisLatestIds()),
                 sorted(result.scheduleRepairIds()),
-                sorted(result.mqConsumedIds()),
-                sorted(result.suspectedLostIds()),
-                sorted(result.consumeButStaleIds()),
                 sorted(result.repairFailedIds()));
     }
 
@@ -161,21 +114,15 @@ public class BannerReconciliationService {
     /** 对账结果快照，各 ID 集合在构造时转为不可变 Set。 */
     public record BannerAuditResult(
             /** 对账窗口起始时刻（含）。 */
-            LocalDateTime windowStart,
+            Long windowStart,
             /** 对账窗口结束时刻（不含）。 */
-            LocalDateTime windowEnd,
+            Long windowEnd,
             /** MySQL 在该窗口内有 update_time 变更的 bannerId。 */
             Set<Long> dbChangedIds,
             /** Redis Runtime 已与 MySQL 对齐、无需修复的 bannerId。 */
             Set<Long> redisLatestIds,
             /** 定时任务已成功修复 Redis 的 bannerId。 */
             Set<Long> scheduleRepairIds,
-            /** Kafka 消费窗口记录中出现过的 bannerId。 */
-            Set<Long> mqConsumedIds,
-            /** 定时修复了但 Kafka 窗口无记录的 bannerId（疑似丢消息）。 */
-            Set<Long> suspectedLostIds,
-            /** 定时修复了且 Kafka 有记录但 Redis 仍过期的 bannerId。 */
-            Set<Long> consumeButStaleIds,
             /** 修复过程中抛异常的 bannerId。 */
             Set<Long> repairFailedIds) {
 
@@ -184,9 +131,6 @@ public class BannerReconciliationService {
             dbChangedIds = Set.copyOf(dbChangedIds);
             redisLatestIds = Set.copyOf(redisLatestIds);
             scheduleRepairIds = Set.copyOf(scheduleRepairIds);
-            mqConsumedIds = Set.copyOf(mqConsumedIds);
-            suspectedLostIds = Set.copyOf(suspectedLostIds);
-            consumeButStaleIds = Set.copyOf(consumeButStaleIds);
             repairFailedIds = Set.copyOf(repairFailedIds);
         }
     }

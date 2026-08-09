@@ -11,9 +11,6 @@ import com.bannerdeliver.mapper.BannerInfoMapper;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
-import java.time.Clock;
-import java.time.Instant;
-import java.time.ZoneId;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -24,10 +21,6 @@ import static org.mockito.Mockito.when;
 
 class BannerBusinessServiceTest {
 
-    private final Clock clock = Clock.fixed(
-            Instant.parse("2026-07-20T01:30:00Z"),
-            ZoneId.of("Asia/Shanghai"));
-
     @Test
     void shouldUpdateBannerAndPublishEventAfterCommit() {
         BannerInfoMapper mapper = mock(BannerInfoMapper.class);
@@ -35,32 +28,30 @@ class BannerBusinessServiceTest {
         BannerInfo current = BannerInfo.builder()
                 .bannerId(20L)
                 .productId(10L)
-                .beginTime("2026-07-20 10:00:00")
-                .endTime("2026-07-20 23:59:59")
+                .beginTime(1784512800000L)
+                .endTime(1784563199000L)
                 .build();
         when(mapper.selectById(20L)).thenReturn(current);
         when(mapper.updateById(any(BannerInfo.class))).thenReturn(1);
-        BannerInfoService service = new BannerInfoService(mapper, producer, clock);
+        BannerInfoService service = new BannerInfoService(mapper, producer);
         BannerInfo update = BannerInfo.builder()
                 .bannerId(20L)
                 .productId(11L)
                 .url("https://cdn/new.png")
                 .build();
 
-        service.updateBanner(update, List.of("product_id", "url"));
+        Long before = System.currentTimeMillis();
+        service.updateBanner(update);
+        Long after = System.currentTimeMillis();
 
-        assertThat(update.getUpdateTime()).isEqualTo("2026-07-20 09:30:00");
+        assertThat(update.getUpdateTime()).isBetween(before, after);
         ArgumentCaptor<BannerDeliveryEvent> eventCaptor =
                 ArgumentCaptor.forClass(BannerDeliveryEvent.class);
         verify(producer).sendAfterCommit(eventCaptor.capture());
+        assertThat(eventCaptor.getValue().getBannerId()).isEqualTo(20L);
         assertThat(eventCaptor.getValue().getEventType())
                 .isEqualTo(BannerEventType.BANNER_UPDATE);
-        assertThat(eventCaptor.getValue().getProductId()).isEqualTo(11L);
-        assertThat(eventCaptor.getValue().getOldProductId()).isEqualTo(10L);
-        assertThat(eventCaptor.getValue().getOldBeginTime()).isEqualTo("2026-07-20 10:00:00");
-        assertThat(eventCaptor.getValue().getOldEndTime()).isEqualTo("2026-07-20 23:59:59");
-        assertThat(eventCaptor.getValue().getChangedFields())
-                .containsExactly("product_id", "url");
+        assertThat(eventCaptor.getValue().getEventTime()).isEqualTo(update.getUpdateTime());
     }
 
     @Test
@@ -75,7 +66,7 @@ class BannerBusinessServiceTest {
         when(infoMapper.updateById(any(BannerInfo.class))).thenReturn(1);
         when(crowdMapper.insert(any(BannerCrowd.class))).thenReturn(1);
         BannerCrowdService service = new BannerCrowdService(
-                crowdMapper, infoMapper, producer, clock);
+                crowdMapper, infoMapper, producer);
         List<BannerCrowd> crowds = List.of(
                 BannerCrowd.builder()
                         .pageNum(0)
@@ -97,13 +88,14 @@ class BannerBusinessServiceTest {
                 .containsOnly(20L);
         assertThat(crowdCaptor.getAllValues())
                 .extracting(BannerCrowd::getUpdateTime)
-                .containsOnly("2026-07-20 09:30:00");
+                .containsOnly(crowdCaptor.getAllValues().get(0).getUpdateTime());
         ArgumentCaptor<BannerDeliveryEvent> eventCaptor =
                 ArgumentCaptor.forClass(BannerDeliveryEvent.class);
         verify(producer).sendAfterCommit(eventCaptor.capture());
+        assertThat(eventCaptor.getValue().getBannerId()).isEqualTo(20L);
         assertThat(eventCaptor.getValue().getEventType())
                 .isEqualTo(BannerEventType.AUDIENCE_UPDATE);
-        assertThat(eventCaptor.getValue().getChangedFields())
-                .containsExactly("user_list");
+        assertThat(eventCaptor.getValue().getEventTime())
+                .isEqualTo(crowdCaptor.getAllValues().get(0).getUpdateTime());
     }
 }

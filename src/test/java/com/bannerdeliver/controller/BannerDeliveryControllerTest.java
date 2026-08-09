@@ -9,8 +9,6 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
-import java.time.LocalDate;
-
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -26,13 +24,13 @@ class BannerDeliveryControllerTest {
                 .bannerId(20L)
                 .productId(10L)
                 .url("https://cdn.example.com/banner.png")
-                .beginTime("2026-07-20 10:00:00")
-                .endTime("2026-07-20 23:59:59")
+                .beginTime(1784512800000L)
+                .endTime(1784563199000L)
                 .build();
         when(deliveryService.query(10L, "1001")).thenReturn(new BannerDeliveryResult(
                 runtime,
                 BannerDeliverySource.TODAY,
-                LocalDate.of(2026, 7, 20)));
+                1784476800000L));
         MockMvc mockMvc = MockMvcBuilders
                 .standaloneSetup(new BannerDeliveryController(deliveryService))
                 .setControllerAdvice(new GlobalExceptionHandler())
@@ -49,6 +47,6 @@ class BannerDeliveryControllerTest {
                 .andExpect(jsonPath("$.data.url")
                         .value("https://cdn.example.com/banner.png"))
                 .andExpect(jsonPath("$.data.source").value("TODAY"))
-                .andExpect(jsonPath("$.data.cacheDate").value("2026-07-20"));
+                .andExpect(jsonPath("$.data.cacheDate").value(1784476800000L));
     }
 }

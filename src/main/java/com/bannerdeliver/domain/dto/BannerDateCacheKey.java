@@ -1,6 +1,5 @@
 package com.bannerdeliver.domain.dto;
 
-import java.time.LocalDate;
 import java.util.Objects;
 
 /**
@@ -10,8 +9,8 @@ import java.util.Objects;
 public record BannerDateCacheKey(
         /** 商品 ID。 */
         Long productId,
-        /** 业务日期（不含时分秒）。 */
-        LocalDate date) {
+        /** 业务日期零点的 Unix 毫秒。 */
+        Long date) {
 
     /** 校验 productId 和 date 均不为 null。 */
     public BannerDateCacheKey {

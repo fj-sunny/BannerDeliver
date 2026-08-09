@@ -1,15 +1,11 @@
 package com.bannerdeliver.domain.dto;
 
-/** Kafka 缓存刷新事件类型。 */
+/** Redis 缓存需要更新的业务部分。 */
 public enum BannerEventType {
-    /** Banner 配置字段变更。 */
+    /** Banner 时间、状态、URL 等基础信息变化。 */
     BANNER_UPDATE,
-    /** 人群包 user_list 变更。 */
+    /** Banner 人群包变化。 */
     AUDIENCE_UPDATE,
-    /** 全量更新（预留）。 */
-    FULL_UPDATE,
-    /** Banner 下线。 */
-    BANNER_OFFLINE,
-    /** Banner 删除（预留）。 */
-    BANNER_DELETE
+    /** Banner 基础信息和人群包同时变化。 */
+    FULL_UPDATE
 }

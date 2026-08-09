@@ -1,6 +1,5 @@
 package com.bannerdeliver.domain.dto;
 
-import java.time.LocalDate;
 import java.util.Objects;
 
 /**
@@ -12,8 +11,8 @@ public record BannerDeliveryResult(
         BannerRuntimeDTO banner,
         /** 数据来源：当天/历史兜底/静态默认。 */
         BannerDeliverySource source,
-        /** 实际读取缓存的业务日期；静态兜底时为 null。 */
-        LocalDate cacheDate) {
+        /** 实际读取缓存日期当天零点的 Unix 毫秒；静态兜底时为 null。 */
+        Long cacheDate) {
 
     /** 校验 banner 和 source 均不为 null。 */
     public BannerDeliveryResult {

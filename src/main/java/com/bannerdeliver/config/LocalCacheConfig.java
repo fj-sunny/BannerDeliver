@@ -7,8 +7,8 @@ import com.google.common.cache.CacheBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /** Guava 本地缓存（L1）的 Spring Bean 配置。 */
 @Configuration
@@ -20,7 +20,7 @@ public class LocalCacheConfig {
             BannerProperties properties) {
         BannerProperties.Local local = properties.getCache().getLocal();
         return CacheBuilder.newBuilder()
-                .expireAfterWrite(Duration.ofSeconds(local.getExpireAfterWriteSeconds()))
+                .expireAfterWrite(local.getExpireAfterWriteSeconds(), TimeUnit.SECONDS)
                 .maximumSize(local.getMaximumSize())
                 .build();
     }
