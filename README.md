@@ -1,190 +1,204 @@
 # BannerDeliver
 
-Banner 投放系统后端骨架，基于 Java 17、Spring Boot、MyBatis-Plus 和 MySQL。
+## 1. 项目背景
 
-## 核心流程
+BannerDeliver 是商品 Banner 投放的读路径与缓存同步服务。
 
-项目只保留三条主链路（MySQL 写库由运营端负责，本服务不实现）：
+运营端负责维护 MySQL 中的 Banner 配置（`banner_info`）和人群包（`banner_crowd`），变更后向 Kafka 投递刷新事件。本服务**不写 MySQL、不生产业务刷新消息**，职责是：
 
-```text
-1. 用户查询   Controller → BannerDeliveryService → BannerCacheService（L1 Guava + L2 Redis）
-2. 缓存刷新   运营端改 MySQL 并投递 Kafka → Consumer → BannerCacheService.refreshBannerCache
-3. 定时对账   BannerReconciliationService → BannerCacheService.refreshBannerCache
-```
+1. 消费运营端 Kafka 事件，从 MySQL 重读最新数据，刷新 Redis 与本机 LocalCache
+2. 对外提供用户投放查询接口，按状态、投放时间、人群包匹配 Banner
+3. 定时对账：发现 Redis 落后于 MySQL 时自动补偿修复
 
-兜底（历史日期、静态默认 Banner）只在 `BannerDeliveryService` 末尾补充，不是主链路。
-
-## 当前结构
+技术栈：Java 17、Spring Boot 3、MyBatis-Plus、MySQL、Redis、Kafka、Guava Cache。
 
 ```text
-src/main/java/com/bannerdeliver
-├── App.java
-├── controller/BannerDeliveryController.java   # 用户查询 HTTP 入口
-├── service/
-│   ├── BannerDeliveryService.java             # 用户查询 + 兜底编排
-│   ├── BannerCacheService.java                # 多级缓存 + Redis + MySQL 只读刷新（核心）
-│   ├── BannerInfoService.java                 # Banner 配置 MySQL 只读
-│   └── BannerCrowdService.java                # 人群包 MySQL 只读
-├── kafka/
-│   └── consumer/BannerEventConsumer.java      # 消费运营端/CDC 投递的刷新事件
-├── schedule/BannerReconciliationService.java  # 定时对账 + 补偿修复
-├── mapper/、domain/、config/、utils/、common/、exception/
+运营端                 BannerDeliver                      用户
+  │                        │                              │
+  │ 写 MySQL               │                              │
+  │ 发 Kafka ───────────► │ Consumer 刷新 Redis/L1        │
+  │                        │                              │
+  │                        │ ◄── GET /banners/delivery ── │
+  │                        │ 读 L1/Redis + 匹配人群        │
+  │                        │ ──► 返回 Banner URL          │
 ```
 
-`BannerCacheService` 统一承担：Guava L1、Redis L2 读写、人群包分桶写入、版本幂等。
+---
 
-本服务不写 MySQL。运营端完成 `banner_info` / `banner_crowd` 变更后，向 Kafka 投递刷新事件；
-`BannerEventConsumer` 调用 `BannerCacheService` 从 MySQL **重读**最新数据，刷新 Redis，
-再删除本机受影响的 L1 Key。
+## 2. 从运营端 Kafka 消息看架构与流程
 
-### 人群变更：运营端写 MySQL，本服务只管 Redis 批次
+### 2.1 架构
 
-| 层 | 谁负责 | 行为 |
+```text
+运营端改 MySQL
+      │
+      ▼
+Kafka Topic: banner-delivery-event
+  key   = bannerId（保证同 Banner 分区有序）
+  value = BannerDeliveryEvent JSON
+      │
+      ▼
+BannerEventConsumer（手动 ack）
+      │
+      ▼
+BannerCacheService.refreshBannerCache
+  ├─ 只读 MySQL：banner_info / banner_crowd
+  ├─ 按需写入 Redis 人群 Set（新 audienceBatch）
+  ├─ HSET 日期 Hash 中的 BannerRuntimeDTO
+  └─ invalidate 本机 Guava LocalCache
+      │
+      ▼
+acknowledge offset
+```
+
+辅助链路：`BannerReconciliationService` 默认每 5 分钟扫描上一个完整时间窗口内 `update_time` 有变更的 Banner；若 Redis Runtime 缺失或落后于 MySQL，则以 `FULL_UPDATE` 走同一套刷新逻辑补偿。
+
+模块边界：
+
+| 模块 | 职责 |
+| --- | --- |
+| `BannerEventConsumer` | 解析/校验消息，调用刷新，成功后 ack |
+| `BannerCacheService` | 多级缓存读写、人群分桶写入、刷新编排 |
+| `BannerInfoService` / `BannerCrowdService` | MySQL **只读** |
+| `BannerReconciliationService` | 定时对账与补偿 |
+
+### 2.2 消息体
+
+Topic 默认：`banner-delivery-event`（可用 `BANNER_EVENT_TOPIC` 覆盖）。
+
+```json
+{
+  "eventId": "evt_20260811_001",
+  "bannerId": 20,
+  "eventType": "AUDIENCE_UPDATE",
+  "eventTime": 1723370000000
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `eventId` | 事件唯一 ID；人群相关刷新时同时作为 Redis 新 `audienceBatch`（不落 MySQL） |
+| `bannerId` | 目标 Banner；建议同时作为 Kafka message key |
+| `eventType` | 刷新范围，见下表 |
+| `eventTime` | 可选；事件发生时间（Unix 毫秒），供排查/审计。对账与 Redis 版本以 MySQL `update_time` 为准 |
+
+`eventType`：
+
+| 类型 | 含义 | 本服务行为 |
 | --- | --- | --- |
-| MySQL `banner_crowd` / `banner_info` | 运营端 | 增删改由运营决定；本服务只读 |
-| Kafka `AUDIENCE_UPDATE` 等 | 运营端 / CDC | 消息携带 `eventId`、`bannerId`、`eventType`、`eventTime` |
-| Redis 人群 Set | 本服务 | **只新增** 新 `audienceBatch`（= `eventId`）的全部 bucket；旧 batch **不 DEL** |
-| Redis 日期 Hash | 本服务 | HSET 更新 `BannerRuntimeDTO.audienceBatch` / `bucketCount` |
-| Guava LocalCache | 本服务 | invalidate 受影响 Key |
+| `BANNER_UPDATE` | 基础信息变化（URL/状态/投放期等） | 尽量复用已有人群 batch，只更新日期 Hash；**仅当投放期变化使人群 TTL 基准变大**（如 `end_time` 跨天延长）时才续期旧人群 Key TTL |
+| `AUDIENCE_UPDATE` | 人群包变化 | 用 `eventId` 写新人群 batch，再切换 Runtime 中的 `audienceBatch`/`bucketCount` |
+| `FULL_UPDATE` | 基础信息 + 人群同时变化 | 完整重写人群与日期 Hash（对账补偿也用此类型） |
+
+约定：
+
+- 消息**只携带定位信息**，业务字段一律从 MySQL 重读，避免消息与库不一致
+- 必填：`eventId`、`bannerId`、`eventType`；`eventTime` 可选（排查用，不参与对账）
+- `eventId` 建议仅含 `[A-Za-z0-9._-]`，否则 Consumer 直接拒收
+- 失败不 ack，固定间隔无限重投；同 `bannerId` 同分区有序
+
+### 2.3 Redis Key 设计
+
+#### 日期 Hash（Banner 运行时快照）
 
 ```text
-运营端更新 MySQL（banner_crowd / banner_info）
+Key:    product:{productId}:date:{业务日零点毫秒}
+Type:   Hash
+Field:  {bannerId}
+Value:  BannerRuntimeDTO JSON
+```
+
+`BannerRuntimeDTO` 主要字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `bannerId` / `productId` / `url` | Banner 标识与资源 |
+| `beginTime` / `endTime` | 投放期，Unix 毫秒 |
+| `status` | `0` 停用，`1` 启用 |
+| `bucketCount` | 人群分桶数；`0` 表示无有效人群 |
+| `audienceBatch` | 当前生效的人群批次号（仅存在于 Redis，不是 MySQL 列） |
+| `updateTime` | 对齐 MySQL `update_time`，供对账比较 |
+
+业务日按固定时区偏移计算（默认 UTC+8，`BANNER_CACHE_ZONE_OFFSET_MILLIS=28800000`）。  
+日期 Hash TTL：业务日 + N 天（默认 N=2）。
+
+#### 人群包分桶 Set
+
+```text
+Key:  banner:audience:{bannerId}:{audienceBatch}:bucket:{index}
+Type: Set
+成员: userId
+```
+
+| 规则 | 计算方式 |
+| --- | --- |
+| `bucketCount` | `ceil(userCount / targetBucketSize)`，默认单桶目标 50000；空人群为 `0` |
+| `bucketIndex` | `floorMod(userId.hashCode(), bucketCount)` |
+| 写入并行度 | `banner.audience.write-parallelism`（默认 4）：先单线程分桶，再并行 `SADD`/`EXPIRE` |
+| 人群 TTL 基准 | 该 Banner 投放期内所有日期 Hash 过期点的**最大值** |
+| 抖动 | 按 Key 做 CRC32 稳定抖动（默认 0～300 秒）；同一 Key 重试抖动不变 |
+| `BANNER_UPDATE` 续期 | 仅当新 TTL 基准 **大于** 旧 Runtime 投放期算出的基准时，才续期旧 `audienceBatch` 各桶 |
+
+本机 L1（Guava）：
+
+```text
+Key:   BannerDateCacheKey(productId, date)
+Value: List<BannerRuntimeDTO>（不可变列表，不含人群包本身）
+TTL:   默认 expireAfterWrite 30s，maximumSize 10000
+```
+
+刷新成功后对本机受影响 Key 执行 `invalidate`，下次查询再回源 Redis。
+
+### 2.4 完整刷新流程（以人群变更为例）
+
+```text
+运营端更新 banner_crowd / banner_info.update_time
         ↓
-运营端投递 Kafka AUDIENCE_UPDATE（eventId = 新 audienceBatch）
+运营端投递 Kafka：AUDIENCE_UPDATE，eventId = evt_002
         ↓
-本服务 Consumer 读 MySQL 最新人群
+Consumer 校验消息 → refreshBannerCache(bannerId, evt_002, AUDIENCE_UPDATE)
         ↓
-SADD 写入 banner:audience:{bannerId}:{evt_new}:bucket:*（不删 evt_old）
+只读 MySQL 最新 banner_info + banner_crowd
         ↓
-全部 bucket 写成功后，HSET product:{productId}:date:{date}
-  中 BannerRuntimeDTO.audienceBatch / bucketCount
+计算投放期内全部业务日 → 得到日期 Hash Key 列表
         ↓
-invalidate 本机 LocalCache
+audienceBatch = evt_002
+计算 bucketCount，按桶 SADD 写入
+  banner:audience:{bannerId}:evt_002:bucket:*
+（不删除旧 batch evt_001）
+        ↓
+全部新 bucket 写成功后，HSET 各日期 Hash：
+  BannerRuntimeDTO.audienceBatch = evt_002
+  BannerRuntimeDTO.bucketCount   = 新值
+（读路径通过指针切换看到新人群；旧 Set 靠 TTL 自然过期）
+        ↓
+invalidate 本机受影响 LocalCache
         ↓
 acknowledge Kafka offset
 ```
 
-旧人群包 Key（例如 `evt_old`）继续留在 Redis，按写入时设置的 TTL 自然过期。
+要点：
 
-## 字段映射
+1. **先写全量新人群，再切换 Runtime 指针**，避免读到「半成品」batch  
+2. **旧人群 Key 不主动 DEL**，靠 TTL 回收  
+3. **重复消费可安全重试**：`SADD`/`HSET` 幂等；同 `eventId` 作为 batch 可继续补齐中断的桶  
+4. `BANNER_UPDATE` 若 Redis 已有可复用的 `audienceBatch`/`bucketCount`，则不重写人群；只有人群 TTL 基准因投放期延长而变大时，才续期旧人群 Key
+5. 人群写入：先单线程分桶，再按 `write-parallelism` 并行刷 Redis；全部成功后才切换 Runtime 指针
 
-| MySQL 字段 | Java 类型 | 说明 |
-| --- | --- | --- |
-| `BIGINT` | `Long` | 主键及关联 ID |
-| `INT` | `Integer` | 人群包页码/桶号 |
-| `TINYINT` | `Integer` | Banner 状态 |
-| `BIGINT` | `Long` | 所有业务时间统一使用 Unix 毫秒 |
-| `BLOB` | `String` | `user_list` 通过 UTF-8 TypeHandler 读写 |
+---
 
-`StringBlobTypeHandler` 负责把 Java `String` 按 UTF-8 转成字节写入 BLOB，并在查询时按
-UTF-8 还原，避免依赖 JDBC 驱动的隐式类型转换。
+## 3. 从用户角度看获取 Banner 的业务逻辑
 
-`user_list` 推荐保存 JSON 数组，例如 `["1001","1002"]`。当前解码器也兼容逗号或
-换行分隔的历史格式。
-
-## 多级缓存
-
-| 层级 | 实现 | 说明 |
-| --- | --- | --- |
-| L1 | Guava `Cache`（内嵌于 `BannerCacheService`） | Key=`productId+date`，TTL 30s |
-| L2 | Redis Hash | `product:{productId}:date:{业务日零点毫秒}` 存 Banner JSON |
-| 人群 | Redis Set | 分桶 `SISMEMBER` 判断用户归属 |
-
-查询：`BannerCacheService.getBanners` → 过滤 status/时间 → `isAudienceMember`。
-刷新后立即删除本机受影响的 L1 Key，下次查询再回源 Redis；其他实例最终一致仍依赖 L1 TTL。
-
-## Redis 缓存
-
-| 用途 | Key | 类型 |
-| --- | --- | --- |
-| Banner 日期缓存 | `product:{productId}:date:{业务日零点毫秒}` | Hash |
-| 人群包分桶 | `banner:audience:{bannerId}:{audienceBatch}:bucket:{index}` | Set |
-
-Redis 只保存 Banner 日期 Hash 和人群包 Set。
-
-- 日期 Hash 在业务日期加两天的 `00:00` 绝对过期。
-- 业务日按 `BANNER_CACHE_ZONE_OFFSET_MILLIS` 固定偏移计算，默认 `28800000`（UTC+8）。
-- 人群包 TTL：
-  - 基准 = 该 Banner 投放期内所有日期 Hash 过期点的 **最大值**
-    （每个业务日 `date + expire-after-date-days`，默认 +2 天）。
-  - 再按 Key 做 CRC32 稳定抖动（默认 0～300 秒）；同一 Key 重试抖动不变。
-  - 切换新 `audienceBatch` 时 **不会** 修改旧 batch Key 的 TTL；旧 Key 按写入时的过期点消失。
-- `bucketCount = ceil(userCount / targetBucketSize)`；空人群包为 `0`。
-- `bucketIndex = floorMod(userId.hashCode(), bucketCount)`。
-- 消费者只按 MySQL 最新投放范围新增或覆盖日期 Hash，不记录旧商品和旧日期范围。
-- 新 `audienceBatch` 全部写完后才写入日期 Hash；旧批次等待 TTL 自动删除，代码路径不主动 DEL。
-- Redis 读写统一在 `BannerCacheService` 中完成。
-- `audienceBatch` / `bucketCount` 只存在于 Redis 的 `BannerRuntimeDTO` JSON，不是 MySQL 列。
-
-## Kafka 刷新
-
-- Topic：`banner-delivery-event`，可通过 `BANNER_EVENT_TOPIC` 修改。
-- 消息由运营端（或 CDC）在 MySQL 变更后投递；message key 建议固定为 `bannerId` 字符串，保证同 Banner 有序。
-- 本服务只消费、不生产业务刷新事件。
-- Consumer 使用手动提交 offset，Redis 和本地缓存更新成功后才确认消息。
-- 处理失败时不提交 offset，并按固定间隔重新投递。
-- Consumer 只使用消息定位 Banner，`eventTime` 为 Unix 毫秒；业务字段从 MySQL 的 `banner_info`、`banner_crowd`
-  重新读取。
-- 重复事件每次都从 MySQL 读取最新数据并全量刷新。
-
-Kafka Topic 需要在部署环境预先创建。运营端更新 MySQL 成功后投递事件，消息字段：
-`eventId`、`bannerId`、`eventType`、`eventTime`。
-
-### 重复消费与幂等
-
-系统不额外保存“已消费 eventId”来阻止重复消息，而是让每一步都可以安全重试：
-
-- 人群变更消息使用 `eventId` 作为新的 `audienceBatch`。
-- Kafka 消息包含 `eventId`、`bannerId`、`eventType`、`eventTime`，不携带旧商品和旧日期范围。
-- `BANNER_UPDATE` 更新 Banner 日期 Hash；`AUDIENCE_UPDATE` 更新人群 Set，并切换日期 Hash 中的人群批次。
-- `FULL_UPDATE` 用于 Banner 基础信息和人群包同时变化，完整更新上述两部分。
-- 人群包使用 `SADD`，重复 userId 自动去重；重试会继续补齐中断前未写完的桶。
-- Banner 日期 Hash 按 `bannerId` 执行 `HSET`。
-
-Consumer 的固定执行顺序为：
-
-```text
-查询 MySQL 最新数据
-→ 人群变更时：新增 Redis audienceBatch 全部分桶（不删旧 batch）
-→ HSET 日期 Hash，切换 BannerRuntimeDTO.audienceBatch / bucketCount
-→ 删除受影响的 LocalCache Key
-→ acknowledge Kafka offset
-```
-
-业务 Redis 或本地缓存刷新失败时，`acknowledge()` 不会执行。Consumer 配置为
-`manual_immediate`，`DefaultErrorHandler` 使用固定间隔无限重投；同一 `bannerId` 作为 Kafka
-message key，保证同分区内消息顺序。
-
-## Guava LocalCache
-
-- Key：`BannerDateCacheKey(productId, date)`，内嵌于 `BannerCacheService`。
-- Value：不可变 `List<BannerRuntimeDTO>`，不缓存人群包。
-- 默认 `expireAfterWrite` 30 秒，`maximumSize` 10000。
-- 并发未命中时 Guava `Cache.get` 合并回源 Redis。
-- Kafka/定时刷新完成后立即删除受影响的 Key。
-
-多个 Banner 同时命中时按 `bannerId` 升序，取第一个。
-
-## Banner 投放查询接口
+### 3.1 接口
 
 ```http
 GET /api/v1/banners/delivery?productId=10&userId=1001
 ```
 
-`productId` 必须为正数，`userId` 不能为空且最长 128 个字符。核心查询过程：
+- `productId`：正数  
+- `userId`：非空，最长 128 字符  
 
-```text
-当天 productId + date LocalCache
-→ 未命中时读取 Redis 日期 Hash 并写入 LocalCache
-→ 筛选 status=1 和 beginTime <= 当前时间 <= endTime
-→ 根据 bucketCount 计算 bucketIndex
-→ Redis SISMEMBER 检查 userId
-```
-
-以上逻辑在 `BannerDeliveryService` 中完成；当天未命中时再尝试历史日期兜底。
-
-昨日兜底使用“前一天相同的时分秒”检查投放时间，否则昨日 Runtime 的 `endTime` 与今天时间
-比较时必然已经过期。返回示例：
+返回示例：
 
 ```json
 {
@@ -202,75 +216,120 @@ GET /api/v1/banners/delivery?productId=10&userId=1001
 }
 ```
 
-`source` 可能为 `TODAY`、`PREVIOUS_DATE` 或 `STATIC_DEFAULT`。静态默认 Banner 通过以下
-环境变量配置：
+`source`：
 
-```properties
-BANNER_DEFAULT_ID=0
-BANNER_DEFAULT_URL=https://cdn.example.com/default-banner.png
+| 值 | 含义 |
+| --- | --- |
+| `TODAY` | 当天业务日缓存命中 |
+| `PREVIOUS_DATE` | 历史业务日缓存兜底命中 |
+| `STATIC_DEFAULT` | 配置的静态默认 Banner |
+
+### 3.2 匹配逻辑（`BannerDeliveryService`）
+
+```text
+now = 当前时刻
+today = 业务日零点(now)
+
+① 读当天缓存候选列表（L1 → 未命中再回源 Redis 日期 Hash）
+   按 bannerId 升序逐个判断：
+     1. status == 1
+     2. beginTime <= now <= endTime
+     3. userId 属于该 Banner 人群包
+        （bucketIndex = hash % bucketCount，再 SISMEMBER）
+   命中则返回，source = TODAY
+
+② 当天未命中 → 读历史业务日缓存（默认回退 1 天）
+   仍按上面 1 → 2 → 3 判断（时间条件继续比「现在」）
+   命中则返回，source = PREVIOUS_DATE
+
+③ 仍未命中 → 返回静态默认 Banner
+   source = STATIC_DEFAULT
 ```
 
-## 定时修复与消息对账
+人群判断细节：
 
-`BannerReconciliationService` 默认每 5 分钟触发，检查上一个完整窗口。例如任务在
-`10:05～10:10` 之间触发时，只处理 `[10:00:00, 10:05:00)`，避免把仍在写入的数据纳入
-对账。`update_time` 使用 Unix 毫秒，MySQL 直接进行 `BIGINT` 范围查询。
-建表脚本已为该范围查询增加 `idx_update_time`。
+```text
+若 bucketCount <= 0 → 非人群成员
+否则：
+  bucketIndex = floorMod(userId.hashCode(), bucketCount)
+  SISMEMBER banner:audience:{bannerId}:{audienceBatch}:bucket:{bucketIndex} userId
+```
 
-旧数据库的时间列如果还是 `VARCHAR(19)`，必须先备份，再执行迁移脚本：
+注意：status / 投放时间未通过时，**不会**发起人群包查询。
+
+---
+
+## 4. 难点与解决方法
+
+### 4.1 大人群包不能阻塞读路径，也不能半切换
+
+**难点**：人群可达百万级，全量写 Redis 耗时长；若边写边切指针，用户会读到不完整人群。
+
+**做法**：
+
+- 人群按桶拆分写入（默认约 5 万用户/桶，批量 SADD）
+- 新 `audienceBatch`（`eventId`）全部写完后，才 HSET 切换 Runtime 指针
+- 旧 batch 不删，靠 TTL 回收，切换瞬间读路径原子切到新 batch
+
+### 4.2 消息与库一致性、重复消费
+
+**难点**：Kafka 可能重复投递；消息若携带业务快照，容易与 MySQL 最终态不一致。
+
+**做法**：
+
+- 消息必带 `eventId/bannerId/eventType`（`eventTime` 可选），业务一律重读 MySQL
+- 人群 batch 用 `eventId` 命名，重试可继续 `SADD` 补齐
+- 手动 ack：Redis/L1 全部成功后才提交 offset；失败固定间隔重投
+- message key = `bannerId`，保证同 Banner 有序处理
+
+### 4.3 多级缓存一致性
+
+**难点**：Guava L1 与 Redis L2 并存；本机刷新后其他实例仍可能短暂读到旧 L1。
+
+**做法**：
+
+- 刷新成功后对本机受影响 Key 直接 `invalidate`（不回填覆盖）
+- L1 短 TTL（默认 30s），跨实例最终一致依赖 TTL
+- 定时对账扫描 MySQL `update_time` 窗口，落后则 `FULL_UPDATE` 补偿
+
+### 4.4 投放查询要又快又准
+
+**难点**：高 QPS 下既要过滤状态/时间，又要做人群归属判断。
+
+**做法**：
+
+- 候选 Banner 放日期 Hash，L1 按 `productId+date` 缓存列表
+- 严格按 `status → 当前时间是否在投放期 → 人群 SISMEMBER` 短路过滤
+- 多个命中取最小 `bannerId`；当天无结果再走历史日缓存与静态默认兜底
+
+### 4.5 职责边界清晰
+
+**难点**：若投放服务同时写库、发消息，会与运营端职责纠缠，难演进。
+
+**做法**：
+
+- MySQL 增删改与 Kafka 生产留给运营端
+- 本服务只做：消费事件 → 只读 MySQL → 刷新缓存 → 用户查询 / 对账补偿
+
+---
+
+## 附录：本地启动与配置
+
+1. 创建 MySQL 库并执行 [schema.sql](src/main/resources/db/schema.sql)  
+2. 复制 `.env.example` 为 `.env` 并填写连接信息  
+3. 预先创建 Kafka Topic（默认 `banner-delivery-event`）  
+4. 启动：
+
+```bash
+./mvnw spring-boot:run
+```
+
+默认端口 `8080`。完整环境变量见 [.env.example](.env.example)。
+
+若历史库时间列仍是字符串，需先备份再执行：
 
 ```bash
 mysql < src/main/resources/db/migrate_time_to_bigint.sql
 ```
 
-本次改造同时改变了 Redis 日期 Key 和缓存 JSON 的时间类型。部署时需要清理旧的
-`product:*:date:*` 和 `banner:audience:*`，
-再通过 Kafka 或定时对账从 MySQL 重建缓存；切换前也应处理完旧格式 Kafka 消息。
-
-处理顺序如下：
-
-1. 查询窗口内 MySQL 更新过的 Banner。
-2. 检查 Banner 应覆盖的每一个 Redis 日期 Hash；任一字段不存在、JSON 无法解析、
-   `updateTime` 为空或早于 MySQL，都判定需要修复。
-3. 以稳定的 `schedule_{window}_{bannerId}` 作为 `audienceBatch`，复用完整刷新流程写人群包、
-   切换 Banner JSON，并删除本实例受影响的 Guava LocalCache Key。
-日志同时输出数量和排序后的 ID 明细。单个 Banner 修复异常不会阻止其他 Banner，异常 ID
-额外记录在 `repairFailedIds` 中。默认配置为：
-
-```properties
-BANNER_RECONCILIATION_ENABLED=true
-BANNER_RECONCILIATION_WINDOW_MINUTES=5
-BANNER_RECONCILIATION_CRON=0 */5 * * * *
-```
-
-修改窗口大小时应同步调整 Cron 表达式。多实例部署会重复执行该任务，但稳定批次号、`SADD`
-和 `HSET` 保证结果幂等；如需避免重复扫描，可在部署层只启用一个调度实例。
-
-## 本地启动
-
-1. 在 MySQL 中创建数据库，例如 `banner_deliver`。
-2. 执行 [schema.sql](src/main/resources/db/schema.sql)。
-3. 复制环境变量模板并填写本地连接信息：
-
-```bash
-cp .env.example .env
-```
-
-`.env` 会在启动时自动加载，已被 `.gitignore` 排除，不会提交到 GitHub。请不要在
-`.env.example` 中填写真实密码。配置完成后启动：
-
-```bash
-mvn spring-boot:run
-```
-
-应用默认监听 `8080` 端口。项目默认不会自动执行建表脚本，避免误改已有数据库结构。
-
-## 环境变量
-
-完整参数及安全默认值见 [.env.example](.env.example)，包含：
-
-- MySQL 连接、超时和 HikariCP 连接池参数
-- Redis 连接、超时和连接池参数
-- Kafka Broker、Consumer Group、并发度和事件 Topic
-- 人群包目标单桶人数、LocalCache 和 Redis TTL 参数
-- 5 分钟对账任务及日志级别
+时间类型切换后，建议清理旧 Redis Key（`product:*:date:*`、`banner:audience:*`），再通过 Kafka 或对账任务重建缓存。

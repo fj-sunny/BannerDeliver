@@ -38,10 +38,10 @@ public class BannerEventConsumer {
         if (event.getBannerId() == null
                 || event.getEventId() == null
                 || !event.getEventId().matches("[A-Za-z0-9._-]+")
-                || event.getEventType() == null
-                || event.getEventTime() == null) {
+                || event.getEventType() == null) {
             throw new IllegalArgumentException("Invalid banner event");
         }
+        // eventTime 可选，仅便于排查；刷新与对账版本以 MySQL update_time 为准。
         cacheService.refreshBannerCache(
                 event.getBannerId(), event.getEventId(), event.getEventType());
         acknowledgment.acknowledge();
