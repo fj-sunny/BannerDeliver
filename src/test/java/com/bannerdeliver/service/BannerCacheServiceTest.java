@@ -27,7 +27,7 @@ import static org.mockito.Mockito.when;
 class BannerCacheServiceTest {
 
     @Test
-    void shouldWriteRedisAndRefreshLocalCache() throws Exception {
+    void shouldWriteRedisAndInvalidateLocalCache() throws Exception {
         StringRedisTemplate redisTemplate = mock(StringRedisTemplate.class);
         @SuppressWarnings("unchecked")
         HashOperations<String, Object, Object> hashOperations = mock(HashOperations.class);
@@ -35,6 +35,12 @@ class BannerCacheServiceTest {
         ObjectMapper objectMapper = new ObjectMapper();
         Cache<BannerDateCacheKey, List<BannerRuntimeDTO>> localCache =
                 CacheBuilder.newBuilder().maximumSize(100).build();
+        BannerDateCacheKey cacheKey = new BannerDateCacheKey(10L, 1784476800000L);
+        localCache.put(cacheKey, List.of(BannerRuntimeDTO.builder()
+                .bannerId(20L)
+                .productId(10L)
+                .audienceBatch("evt_old")
+                .build()));
         BannerCacheExpiryCalculator expiryCalculator = mock(BannerCacheExpiryCalculator.class);
         when(expiryCalculator.dateCacheExpireAt(anyLong()))
                 .thenReturn(1784736000000L);
@@ -52,19 +58,6 @@ class BannerCacheServiceTest {
                 .build();
         when(infoService.findById(20L)).thenReturn(banner);
         when(crowdService.findByBannerId(20L)).thenReturn(List.of());
-        BannerRuntimeDTO expectedRuntime = BannerRuntimeDTO.builder()
-                .bannerId(20L)
-                .productId(10L)
-                .url(banner.getUrl())
-                .beginTime(banner.getBeginTime())
-                .endTime(banner.getEndTime())
-                .status(1)
-                .bucketCount(0)
-                .audienceBatch("evt_1")
-                .updateTime(banner.getUpdateTime())
-                .build();
-        when(hashOperations.values("product:10:date:1784476800000"))
-                .thenReturn(List.of(objectMapper.writeValueAsString(expectedRuntime)));
         BannerCacheService service = new BannerCacheService(
                 localCache, redisTemplate, objectMapper,
                 bucketCalculator, expiryCalculator, new BannerProperties(),
@@ -72,9 +65,7 @@ class BannerCacheServiceTest {
 
         service.refreshBannerCache(20L, "evt_1", BannerEventType.AUDIENCE_UPDATE);
 
-        assertThat(localCache.getIfPresent(
-                new BannerDateCacheKey(10L, 1784476800000L)))
-                .containsExactly(expectedRuntime);
+        assertThat(localCache.getIfPresent(cacheKey)).isNull();
         verify(hashOperations).put(
                 org.mockito.ArgumentMatchers.eq("product:10:date:1784476800000"),
                 org.mockito.ArgumentMatchers.eq("20"),

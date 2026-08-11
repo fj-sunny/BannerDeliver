@@ -15,8 +15,14 @@ import java.util.Optional;
 /**
  * 用户 Banner 投放查询。
  *
- * <p>核心：当天 LocalCache → Redis → 状态/时间/人群匹配。
- * 兜底：历史日期、静态默认 Banner（补充）。</p>
+ * <pre>
+ * 对缓存中的候选 Banner 按 bannerId 升序逐个判断：
+ *   1. status == 1
+ *   2. beginTime/endTime 覆盖「当前时刻」
+ *   3. userId 属于该 Banner 人群包
+ * 当天无命中 → 读历史业务日缓存，仍按上面 1→2→3 判断（时间仍比「现在」）
+ * 仍无命中 → 静态默认 Banner
+ * </pre>
  */
 @Service
 @RequiredArgsConstructor
@@ -25,92 +31,70 @@ public class BannerDeliveryService {
     private final BannerCacheService cacheService;
     private final BannerProperties properties;
 
-    /**
-     * 用户 Banner 投放查询入口。
-     * 优先当天命中，未命中则走历史日期或静态默认兜底。
-     */
+    /** 投放查询入口。 */
     public BannerDeliveryResult query(Long productId, String userId) {
-        Long queryTime = System.currentTimeMillis();
-        Long queryDate = BannerTimeUtils.startOfDay(
-                queryTime, properties.getCache().getRedis().getZoneOffsetMillis());
+        long now = System.currentTimeMillis();
+        long zoneOffset = properties.getCache().getRedis().getZoneOffsetMillis();
+        long today = BannerTimeUtils.startOfDay(now, zoneOffset);
 
-        Optional<BannerRuntimeDTO> today = findFirstEligible(
-                productId, userId, queryTime, queryDate);
-        if (today.isPresent()) {
-            return new BannerDeliveryResult(
-                    today.get(),
-                    BannerDeliverySource.TODAY,
-                    queryDate);
+        // 当天：status → 当前时间范围 → 人群包
+        Optional<BannerRuntimeDTO> matched = findFirstMatch(productId, userId, now, today);
+        if (matched.isPresent()) {
+            return new BannerDeliveryResult(matched.get(), BannerDeliverySource.TODAY, today);
         }
-        return resolveFallback(productId, userId, queryTime);
-    }
 
-    /** 返回指定业务日期内所有符合状态、投放时间和人群条件的 Banner。 */
-    public List<BannerRuntimeDTO> findEligibleBanners(
-            Long productId, String userId, Long queryTime) {
-        Long queryDate = BannerTimeUtils.startOfDay(
-                queryTime, properties.getCache().getRedis().getZoneOffsetMillis());
-        return eligibleCandidates(productId, queryTime, queryDate)
-                .filter(runtime -> cacheService.isAudienceMember(runtime, userId))
-                .toList();
-    }
-
-    /** 返回首个符合条件的 Banner，按 bannerId 升序取第一个。 */
-    private Optional<BannerRuntimeDTO> findFirstEligible(
-            Long productId, String userId, Long queryTime, Long cacheDate) {
-        return eligibleCandidates(productId, queryTime, cacheDate)
-                .filter(runtime -> cacheService.isAudienceMember(runtime, userId))
-                .findFirst();
-    }
-
-    /** 从缓存加载候选 Banner 并按 status、投放时间过滤排序。 */
-    private java.util.stream.Stream<BannerRuntimeDTO> eligibleCandidates(
-            Long productId, Long queryTime, Long cacheDate) {
-        return cacheService.getBanners(productId, cacheDate).stream()
-                .filter(runtime -> Integer.valueOf(1).equals(runtime.getStatus()))
-                .filter(runtime -> isWithinDeliveryTime(runtime, queryTime))
-                .sorted(Comparator.comparing(BannerRuntimeDTO::getBannerId));
-    }
-
-    /** 当天未命中时，尝试历史日期兜底或返回静态默认 Banner。 */
-    private BannerDeliveryResult resolveFallback(
-            Long productId, String userId, Long queryTime) {
-        Long fallbackDays = properties.getCache().getRedis().getFallbackDays();
+        // 兜底 1：历史业务日缓存（时间条件仍用「现在」）
+        long fallbackDays = properties.getCache().getRedis().getFallbackDays();
         if (fallbackDays > 0) {
-            Long fallbackQueryTime = queryTime - fallbackDays * BannerTimeUtils.DAY_MILLIS;
-            Long fallbackDate = BannerTimeUtils.startOfDay(
-                    fallbackQueryTime,
-                    properties.getCache().getRedis().getZoneOffsetMillis());
-            Optional<BannerRuntimeDTO> fallbackBanner = findFirstEligible(
-                    productId, userId, fallbackQueryTime, fallbackDate);
-            if (fallbackBanner.isPresent()) {
+            long previousDate = today - fallbackDays * BannerTimeUtils.DAY_MILLIS;
+            matched = findFirstMatch(productId, userId, now, previousDate);
+            if (matched.isPresent()) {
                 return new BannerDeliveryResult(
-                        fallbackBanner.get(),
-                        BannerDeliverySource.PREVIOUS_DATE,
-                        fallbackDate);
+                        matched.get(), BannerDeliverySource.PREVIOUS_DATE, previousDate);
             }
         }
 
-        BannerProperties.DefaultBanner defaultBanner =
-                properties.getDelivery().getDefaultBanner();
-        BannerRuntimeDTO runtime = BannerRuntimeDTO.builder()
-                .bannerId(defaultBanner.getBannerId())
+        // 兜底 2：静态默认
+        BannerProperties.DefaultBanner defaults = properties.getDelivery().getDefaultBanner();
+        BannerRuntimeDTO fallback = BannerRuntimeDTO.builder()
+                .bannerId(defaults.getBannerId())
                 .productId(productId)
-                .url(defaultBanner.getUrl())
+                .url(defaults.getUrl())
                 .status(1)
                 .bucketCount(0)
                 .audienceBatch("static-default")
                 .build();
-        return new BannerDeliveryResult(
-                runtime, BannerDeliverySource.STATIC_DEFAULT, null);
+        return new BannerDeliveryResult(fallback, BannerDeliverySource.STATIC_DEFAULT, null);
     }
 
-    /** 判断 queryTime 是否落在 Banner 的 beginTime 与 endTime 之间（含边界）。 */
-    private boolean isWithinDeliveryTime(BannerRuntimeDTO runtime, Long queryTime) {
-        return runtime.getBeginTime() != null
-                && runtime.getEndTime() != null
-                && queryTime >= runtime.getBeginTime()
-                && queryTime <= runtime.getEndTime();
-    }
+    /**
+     * 从指定业务日缓存选第一个命中 Banner。
+     * 判断顺序固定：status → 当前时间是否在投放期 → 人群包；命中多个时取最小 bannerId。
+     */
+    private Optional<BannerRuntimeDTO> findFirstMatch(
+            Long productId, String userId, long now, long cacheDate) {
+        List<BannerRuntimeDTO> candidates = cacheService.getBanners(productId, cacheDate).stream()
+                .sorted(Comparator.comparing(BannerRuntimeDTO::getBannerId))
+                .toList();
 
+        for (BannerRuntimeDTO runtime : candidates) {
+            // 1. 必须启用
+            if (!Integer.valueOf(1).equals(runtime.getStatus())) {
+                continue;
+            }
+            // 2. 当前时刻必须落在 [beginTime, endTime]
+            if (runtime.getBeginTime() == null
+                    || runtime.getEndTime() == null
+                    || now < runtime.getBeginTime()
+                    || now > runtime.getEndTime()) {
+                continue;
+            }
+            // 3. 用户必须在人群包内
+            if (!cacheService.isAudienceMember(runtime, userId)) {
+                continue;
+            }
+            return Optional.of(runtime);
+        }
+        return Optional.empty();
+    }
 }

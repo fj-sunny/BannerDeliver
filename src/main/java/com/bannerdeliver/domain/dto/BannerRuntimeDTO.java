@@ -26,7 +26,11 @@ public class BannerRuntimeDTO {
     private Integer status;
     /** 人群包分桶总数；0 表示无人群限制。 */
     private Integer bucketCount;
-    /** 人群包批次号，对应 Redis Key 中的 audienceBatch，非桶编号。 */
+    /**
+     * 人群包批次号，仅存在于 Redis Runtime JSON，不是 MySQL 字段。
+     * 对应 Key：{@code banner:audience:{bannerId}:{audienceBatch}:bucket:{index}}。
+     * 人群变更时切到新 eventId；旧 batch 不删，靠 TTL 过期。
+     */
     private String audienceBatch;
     /** 与 MySQL update_time 对齐，Unix 毫秒。 */
     private Long updateTime;

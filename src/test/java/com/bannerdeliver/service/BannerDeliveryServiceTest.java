@@ -9,12 +9,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
-import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 class BannerDeliveryServiceTest {
@@ -45,11 +44,10 @@ class BannerDeliveryServiceTest {
     }
 
     @Test
-    void shouldUsePreviousDateWithSameTimeOfDayAsFallback() {
+    void shouldFallbackToPreviousDateCacheWhileCheckingTimeAgainstNow() {
         BannerRuntimeDTO yesterday = runtime(19L, "yesterday.png");
         when(cacheService.getBanners(10L, TODAY)).thenReturn(List.of());
-        when(cacheService.getBanners(10L, YESTERDAY))
-                .thenReturn(List.of(yesterday));
+        when(cacheService.getBanners(10L, YESTERDAY)).thenReturn(List.of(yesterday));
         when(cacheService.isAudienceMember(yesterday, "1001")).thenReturn(true);
 
         BannerDeliveryResult result = service.query(10L, "1001");
@@ -76,20 +74,26 @@ class BannerDeliveryServiceTest {
     }
 
     @Test
-    void shouldFilterCandidatesByStatusTimeAndAudience() {
-        BannerRuntimeDTO eligible = runtime(20L, "eligible.png");
+    void shouldCheckStatusThenTimeThenAudienceInOrder() {
         BannerRuntimeDTO offline = BannerRuntimeDTO.builder()
-                .bannerId(21L).status(0)
+                .bannerId(10L).status(0)
                 .beginTime(NOW - 1000L).endTime(NOW + 1000L).build();
-        BannerRuntimeDTO audienceMiss = runtime(22L, "miss.png");
+        BannerRuntimeDTO outOfTime = BannerRuntimeDTO.builder()
+                .bannerId(11L).status(1)
+                .beginTime(NOW - 10_000L).endTime(NOW - 1000L).build();
+        BannerRuntimeDTO audienceMiss = runtime(12L, "miss.png");
+        BannerRuntimeDTO eligible = runtime(20L, "eligible.png");
         when(cacheService.getBanners(10L, TODAY))
-                .thenReturn(List.of(audienceMiss, offline, eligible));
-        when(cacheService.isAudienceMember(eligible, "1001")).thenReturn(true);
+                .thenReturn(List.of(eligible, audienceMiss, outOfTime, offline));
         when(cacheService.isAudienceMember(audienceMiss, "1001")).thenReturn(false);
+        when(cacheService.isAudienceMember(eligible, "1001")).thenReturn(true);
 
-        assertThat(service.findEligibleBanners(10L, "1001", NOW))
-                .extracting(BannerRuntimeDTO::getBannerId)
-                .containsExactly(20L);
+        BannerDeliveryResult result = service.query(10L, "1001");
+
+        assertThat(result.source()).isEqualTo(BannerDeliverySource.TODAY);
+        assertThat(result.banner().getBannerId()).isEqualTo(20L);
+        verify(cacheService, never()).isAudienceMember(offline, "1001");
+        verify(cacheService, never()).isAudienceMember(outOfTime, "1001");
     }
 
     private BannerRuntimeDTO runtime(Long bannerId, String url) {

@@ -11,9 +11,11 @@ import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
 
 /**
- * Kafka 消费：MySQL 重读 → 刷新 Redis → 记录消费窗口 → 手动 ack。
+ * Kafka 消费：MySQL 重读 → 刷新 Redis（人群变更时新增 batch 并切换 Runtime 指针）
+ * → 删除 LocalCache → 手动 ack。
  *
- * <p>失败不 ack，由 ErrorHandler 固定间隔重投；eventId 作 audienceBatch 保证幂等。</p>
+ * <p>失败不 ack，由 ErrorHandler 固定间隔重投。
+ * {@code eventId} 作为新 {@code audienceBatch}；旧 Redis 人群 Key 不删，靠 TTL 过期。</p>
  */
 @Component
 @RequiredArgsConstructor
@@ -22,7 +24,7 @@ public class BannerEventConsumer {
     private final ObjectMapper objectMapper;
     private final BannerCacheService cacheService;
 
-    /** 刷新 Redis 和本地缓存，全部成功后才提交 offset。 */
+    /** 刷新 Redis 并删除本地缓存，全部成功后才提交 offset。 */
     @KafkaListener(
             topics = "${banner.kafka.event-topic}",
             groupId = "${spring.kafka.consumer.group-id}")
