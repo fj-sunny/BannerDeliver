@@ -60,6 +60,10 @@ public class BannerProperties {
         /** 单次 SADD 的最大 userId 数量。 */
         @Min(1)
         private int redisWriteBatchSize = 1000;
+
+        /** 人群包 Redis 写入并行度；1 表示单线程。 */
+        @Min(1)
+        private int writeParallelism = 4;
     }
 
     /** 多级缓存（L1 Guava + L2 Redis）配置。 */

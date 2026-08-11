@@ -21,6 +21,9 @@ public class BannerDeliveryEvent {
     /** 需要更新的 Redis 数据部分。 */
     private BannerEventType eventType;
 
-    /** 事件发生时间，Unix 毫秒，用于对账窗口划分。 */
+    /**
+     * 事件发生时间，Unix 毫秒；可选，供排查/审计。
+     * 对账与 Redis {@code updateTime} 均以 MySQL {@code update_time} 为准，不使用本字段。
+     */
     private Long eventTime;
 }

@@ -54,6 +54,22 @@ class BannerEventConsumerTest {
         verify(acknowledgment, never()).acknowledge();
     }
 
+    @Test
+    void shouldAcceptEventWithoutEventTime() throws Exception {
+        BannerDeliveryEvent event = BannerDeliveryEvent.builder()
+                .eventId("evt_20260720_001")
+                .bannerId(20L)
+                .eventType(BannerEventType.AUDIENCE_UPDATE)
+                .build();
+        Acknowledgment acknowledgment = mock(Acknowledgment.class);
+
+        consumer.consume(record(event), acknowledgment);
+
+        verify(cacheService).refreshBannerCache(
+                20L, event.getEventId(), BannerEventType.AUDIENCE_UPDATE);
+        verify(acknowledgment).acknowledge();
+    }
+
     private ConsumerRecord<String, String> record(BannerDeliveryEvent event) throws Exception {
         return new ConsumerRecord<>(
                 "banner-delivery-event",

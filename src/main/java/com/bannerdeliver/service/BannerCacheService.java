@@ -28,7 +28,10 @@ import java.util.Map; // 引入 Map 接口
 import java.util.Objects; // 引入 Objects 工具类
 import java.util.Optional; // 引入 Optional 容器
 import java.util.Set; // 引入 Set 接口
+import java.util.concurrent.CompletableFuture; // 引入并行写入 Future
+import java.util.concurrent.CompletionException; // 引入并行汇总异常
 import java.util.concurrent.ExecutionException; // 引入异步/缓存加载异常
+import java.util.concurrent.ExecutorService; // 引入人群写入线程池
 import java.util.concurrent.TimeUnit; // 引入时间单位枚举
 
 /**
@@ -51,6 +54,7 @@ public class BannerCacheService { // Banner 多级缓存服务类开始
     private final AudienceUserListCodec userListCodec; // 解码 MySQL user_list
     private final BannerInfoService bannerInfoService; // 只读查询 banner_info
     private final BannerCrowdService bannerCrowdService; // 只读查询 banner_crowd
+    private final ExecutorService audienceWriteExecutor; // 人群包 Redis 并行写入线程池
 
     /** L1 未命中回源 Redis；并发未命中由 Guava Cache.get 合并为一次加载。 */
     public List<BannerRuntimeDTO> getBanners(Long productId, Long date) { // 按商品+业务日查询 Banner 列表
@@ -113,6 +117,8 @@ public class BannerCacheService { // Banner 多级缓存服务类开始
 
         String audienceBatch = null; // 将要写入 Runtime 的人群批次号，先置空
         Integer existingBucketCount = null; // BANNER_UPDATE 时尝试复用的已有桶数
+        Long existingBeginTime = null; // 旧 Runtime 投放开始，用于判断人群 TTL 是否需延长
+        Long existingEndTime = null; // 旧 Runtime 投放结束，用于判断人群 TTL 是否需延长
         if (eventType == BannerEventType.BANNER_UPDATE) { // 仅 Banner 基础信息变更时，尽量不重写人群包
             for (String dateKey : dateKeys.keySet()) { // 在日期 Hash 中查找已有 Runtime
                 Object current = redisTemplate.opsForHash().get( // HGET 读取该 bannerId 字段
@@ -121,6 +127,8 @@ public class BannerCacheService { // Banner 多级缓存服务类开始
                     BannerRuntimeDTO runtime = deserialize(String.valueOf(current)); // JSON -> Runtime 对象
                     audienceBatch = runtime.getAudienceBatch(); // 复用旧 audienceBatch
                     existingBucketCount = runtime.getBucketCount(); // 复用旧 bucketCount
+                    existingBeginTime = runtime.getBeginTime(); // 记录旧投放起点
+                    existingEndTime = runtime.getEndTime(); // 记录旧投放终点
                     break; // 找到一份即可，不必扫完所有日期
                 } // if 结束
             } // for 结束
@@ -140,15 +148,10 @@ public class BannerCacheService { // Banner 多级缓存服务类开始
                         audienceExpiry) // 人群 Key 过期基准
                 : existingBucketCount; // 不刷新人群：沿用旧桶数
         if (!refreshAudience) { // BANNER_UPDATE 且成功复用旧 batch
-            // BANNER_UPDATE：复用已有 batch，仅续期人群 Key TTL。
-            for (int bucketIndex = 0; bucketIndex < bucketCount; bucketIndex++) { // 遍历旧 batch 的每个桶
-                String audienceKey = // 拼出该桶 Redis Key
-                        "banner:audience:%s:%s:bucket:%s".formatted( // Key 格式固定
-                                bannerId, audienceBatch, bucketIndex); // bannerId + 旧 batch + 桶下标
-                expireAt( // 重新设置过期时间（续期）
-                        audienceKey, // 目标人群 Key
-                        expiryCalculator.withStableJitter(audienceExpiry, audienceKey)); // 基准过期 + 稳定抖动
-            } // for 结束
+            // 仅当投放期变化使人群 TTL 基准变大（如 end_time 跨天延长）时才续期旧人群 Key。
+            renewAudienceTtlIfExtended(
+                    bannerId, audienceBatch, bucketCount,
+                    audienceExpiry, existingBeginTime, existingEndTime);
         } // if 结束
         // 新 batch 写完后再切换指针；读路径立刻看到新 audienceBatch / bucketCount。
         BannerRuntimeDTO runtime = BannerRuntimeDTO.builder() // 构建要写入日期 Hash 的 Runtime JSON 对象
@@ -230,55 +233,108 @@ public class BannerCacheService { // Banner 多级缓存服务类开始
     /**
      * 将 MySQL 最新人群按 bucketIndex 写入「新」Redis Set，返回 bucketCount。
      *
-     * <p>只新增 {@code banner:audience:{bannerId}:{audienceBatch}:bucket:*}，不删除任何旧 batch。
-     * TTL = {@code baseExpireAt}（投放期最晚日期 Hash 过期点）+ Key 稳定抖动。</p>
+     * <p>先单线程分桶，再按 {@code write-parallelism} 并行 SADD/EXPIRE。
+     * 只新增 {@code banner:audience:{bannerId}:{audienceBatch}:bucket:*}，不删除任何旧 batch。</p>
      */
-    private int writeAudienceVersion( // 写入新 audienceBatch 的全部分桶
-            Long bannerId, String audienceBatch, List<BannerCrowd> crowds, Long baseExpireAt) { // 人群源数据与过期基准
-        long userCount = crowds.stream() // 统计总用户数
-                .map(BannerCrowd::getUserList) // 取每页 user_list 原始串
-                .map(userListCodec::decode) // 解码为 List<userId>
-                .mapToLong(List::size) // 取每页人数
-                .sum(); // 求和得到总人数
-        int bucketCount = bucketCalculator.bucketCount( // 按目标桶大小计算桶数
-                userCount, properties.getAudience().getTargetBucketSize()); // ceil(userCount / targetBucketSize)
-        if (bucketCount == 0) { // 空人群包
-            return 0; // 不写任何 Redis Set，直接返回
-        } // if 结束
-        int writeBatchSize = properties.getAudience().getRedisWriteBatchSize(); // 单次 SADD 批量上限
-        Map<Integer, List<String>> buffers = new HashMap<>(); // 按桶缓存待写入 userId
-        for (BannerCrowd crowd : crowds) { // 遍历每一页人群
-            for (String userId : userListCodec.decode(crowd.getUserList())) { // 解码并遍历每个用户
-                int bucketIndex = bucketCalculator.bucketIndex(userId, bucketCount); // 计算该用户所属桶
-                List<String> buffer = buffers.computeIfAbsent( // 取/建该桶的写缓冲
-                        bucketIndex, ignored -> new ArrayList<>(writeBatchSize)); // 预分配容量
-                buffer.add(userId); // 用户加入缓冲
-                if (buffer.size() >= writeBatchSize) { // 缓冲满了就刷一次 Redis
-                    flushAudienceMembers(bannerId, audienceBatch, bucketIndex, buffer, baseExpireAt); // 批量 SADD + 设 TTL
-                } // if 结束
-            } // 内层 for 结束
-        } // 外层 for 结束
-        buffers.forEach((bucketIndex, buffer) -> // 把各桶剩余缓冲刷完
-                flushAudienceMembers(bannerId, audienceBatch, bucketIndex, buffer, baseExpireAt)); // 尾批写入
-        return bucketCount; // 返回本 batch 的桶总数，供 Runtime 记录
-    } // writeAudienceVersion 结束
+    private int writeAudienceVersion(
+            Long bannerId, String audienceBatch, List<BannerCrowd> crowds, Long baseExpireAt) {
+        long userCount = crowds.stream()
+                .map(BannerCrowd::getUserList)
+                .map(userListCodec::decode)
+                .mapToLong(List::size)
+                .sum();
+        int bucketCount = bucketCalculator.bucketCount(
+                userCount, properties.getAudience().getTargetBucketSize());
+        if (bucketCount == 0) {
+            return 0;
+        }
+        int writeBatchSize = properties.getAudience().getRedisWriteBatchSize();
+        Map<Integer, List<String>> buckets = new HashMap<>();
+        for (BannerCrowd crowd : crowds) {
+            for (String userId : userListCodec.decode(crowd.getUserList())) {
+                int bucketIndex = bucketCalculator.bucketIndex(userId, bucketCount);
+                buckets.computeIfAbsent(bucketIndex, ignored -> new ArrayList<>()).add(userId);
+            }
+        }
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (Map.Entry<Integer, List<String>> entry : buckets.entrySet()) {
+            int bucketIndex = entry.getKey();
+            List<String> users = entry.getValue();
+            for (int from = 0; from < users.size(); from += writeBatchSize) {
+                int to = Math.min(from + writeBatchSize, users.size());
+                List<String> chunk = List.copyOf(users.subList(from, to));
+                futures.add(CompletableFuture.runAsync(
+                        () -> flushAudienceMembers(
+                                bannerId, audienceBatch, bucketIndex, chunk, baseExpireAt),
+                        audienceWriteExecutor));
+            }
+        }
+        try {
+            CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
+        } catch (CompletionException exception) {
+            Throwable cause = exception.getCause() == null ? exception : exception.getCause();
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            throw new IllegalStateException("Audience redis write failed", cause);
+        }
+        return bucketCount;
+    }
+
+    /**
+     * 仅当新投放期算出的人群 TTL 基准大于旧 Runtime 时，才续期旧 audience batch 各桶。
+     * 只改 URL/status 等不改变最长过期点时跳过，避免无意义扫桶。
+     */
+    private void renewAudienceTtlIfExtended(
+            Long bannerId, String audienceBatch, int bucketCount,
+            Long newAudienceExpiry, Long oldBeginTime, Long oldEndTime) {
+        if (bucketCount <= 0 || newAudienceExpiry == null) {
+            return;
+        }
+        Long oldAudienceExpiry = null;
+        if (oldBeginTime != null && oldEndTime != null && oldEndTime >= oldBeginTime) {
+            oldAudienceExpiry = audienceExpiryBaseline(oldBeginTime, oldEndTime);
+        }
+        // 旧期无法还原时保守续期；否则仅在基准变大（如 end_time 跨天延长）时续期。
+        if (oldAudienceExpiry != null && newAudienceExpiry <= oldAudienceExpiry) {
+            return;
+        }
+        for (int bucketIndex = 0; bucketIndex < bucketCount; bucketIndex++) {
+            String audienceKey = "banner:audience:%s:%s:bucket:%s".formatted(
+                    bannerId, audienceBatch, bucketIndex);
+            expireAt(
+                    audienceKey,
+                    expiryCalculator.withStableJitter(newAudienceExpiry, audienceKey));
+        }
+    }
+
+    /** 按投放起止计算人群包 TTL 基准（投放期内日期 Hash 过期点的最大值）。 */
+    private Long audienceExpiryBaseline(Long beginTime, Long endTime) {
+        return BannerTimeUtils.inclusiveDates(
+                        beginTime,
+                        endTime,
+                        properties.getCache().getRedis().getZoneOffsetMillis())
+                .stream()
+                .map(expiryCalculator::dateCacheExpireAt)
+                .max(Long::compareTo)
+                .orElseThrow();
+    }
 
     /**
      * 批量 SADD 一个新 batch 桶内的 userId，并设置绝对过期时间（含稳定抖动）。
      * 不清理同 banner 下其它 audienceBatch 的 Key。
      */
-    private void flushAudienceMembers( // 把一个桶缓冲刷进 Redis
-            Long bannerId, String audienceBatch, int bucketIndex, // 定位到具体 bucket Key
-            List<String> userIds, Long baseExpireAt) { // 待写入用户与过期基准
-        if (userIds.isEmpty()) { // 没有用户可写
-            return; // 直接返回，避免无效 Redis 调用
-        } // if 结束
-        String audienceKey = "banner:audience:%s:%s:bucket:%s".formatted( // 拼人群桶 Key
-                bannerId, audienceBatch, bucketIndex); // 新 batch 的桶 Key（旧 batch 不动）
-        redisTemplate.opsForSet().add(audienceKey, userIds.toArray(String[]::new)); // SADD 批量加入成员
-        expireAt(audienceKey, expiryCalculator.withStableJitter(baseExpireAt, audienceKey)); // 设置带抖动的 TTL
-        userIds.clear(); // 清空缓冲，便于复用该 List
-    } // flushAudienceMembers 结束
+    private void flushAudienceMembers(
+            Long bannerId, String audienceBatch, int bucketIndex,
+            List<String> userIds, Long baseExpireAt) {
+        if (userIds.isEmpty()) {
+            return;
+        }
+        String audienceKey = "banner:audience:%s:%s:bucket:%s".formatted(
+                bannerId, audienceBatch, bucketIndex);
+        redisTemplate.opsForSet().add(audienceKey, userIds.toArray(String[]::new));
+        expireAt(audienceKey, expiryCalculator.withStableJitter(baseExpireAt, audienceKey));
+    }
 
     private void expireAt(String key, Long expireAt) { // 把绝对过期毫秒转成相对 TTL 并设置
         redisTemplate.expire( // 调用 Redis EXPIRE
