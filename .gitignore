@@ -1,0 +1,11 @@
+target/
+.idea/
+*.iml
+.DS_Store
+*.log
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.tools/
