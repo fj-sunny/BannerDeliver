@@ -12,7 +12,7 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 public class BannerDeliveryEvent {
 
-    /** 事件唯一 ID；人群变更时同时作为新的 audienceBatch。 */
+    /** 事件唯一 ID；人群变更时作为 Redis 新 audienceBatch（不落 MySQL）。 */
     private String eventId;
 
     /** 目标 Banner 主键，也是 Kafka message key。 */
